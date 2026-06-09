@@ -20,43 +20,17 @@ namespace {
 
 const char *const TAG = "switchbot_keypad_bridge.cloud";
 
-// The OAuth-style clientId the official SwitchBot app uses. Mirrored
-// from tools/pair_keypad.py.
+// The OAuth-style clientId the official SwitchBot app uses.
 constexpr const char *CLIENT_ID = "5nnwmhmsa9xxskm14hd85lm9bm";
 
 constexpr const char *ACCOUNT_BASE = "https://account.api.switchbot.net";
 
-// SKU → (friendly name, protocol family). SwitchBot serves the same
-// keypad under two different device_type schemes depending on app
-// version and model generation: the legacy "WoKeypad*" SKUs (typical
-// for Original/Touch) and the new numeric "W1115000"-style codes
-// (typical for Vision/Vision Pro). We accept both.
-//
-// The mapping mirrors `DEVICE_TYPE_TO_PRESET` in tools/pair_keypad.py.
-// W1115001 is a best-guess for Vision Pro — confirmed cloud SKUs:
-//   W1115000 → Keypad Vision (verified from the user's account)
-struct KeypadSku {
-  const char *sku;
-  const char *display_name;
-  CloudClient::KeypadFamily family;
-};
-constexpr KeypadSku KEYPAD_SKUS[] = {
-    // Legacy / friendly SKUs (still served for older keypads)
-    {"WoKeypad",          "Keypad",            CloudClient::KeypadFamily::ORIGINAL},
-    {"WoKeypadTouch",     "Keypad Touch",      CloudClient::KeypadFamily::ORIGINAL},
-    {"WoKeypadVision",    "Keypad Vision",     CloudClient::KeypadFamily::VISION},
-    {"WoKeypadVisionPro", "Keypad Vision Pro", CloudClient::KeypadFamily::VISION},
-    // Numeric SKUs (newer cloud responses)
-    {"W1115000",          "Keypad Vision",     CloudClient::KeypadFamily::VISION},
-    {"W1115001",          "Keypad Vision Pro", CloudClient::KeypadFamily::VISION},
-};
-
-const KeypadSku *sku_lookup(const std::string &sku) {
-  for (auto &k : KEYPAD_SKUS) {
-    if (sku == k.sku) return &k;
-  }
-  return nullptr;
-}
+// NOTE: keypads are no longer identified by their cloud SKU. The cloud is used
+// only to enumerate the account's devices (MAC + name) and to fetch each
+// keypad's communication key. Whether a device *is* a keypad — and which
+// protocol family it speaks — is decided solely from its BLE advertisement, the
+// way the official pySwitchbot library does it (see keypad_advert.h). This keeps
+// us from chasing SwitchBot's ever-growing list of device_type codes.
 
 // Convert "B0E9FE612E75" → "B0:E9:FE:61:2E:75". Idempotent on already-
 // pretty input. Defensive on odd-length strings (returns input as-is).
@@ -279,7 +253,7 @@ bool CloudClient::login(const std::string &email, const std::string &password,
   }
 
   // Step 2: userinfo -> region. Failure here is non-fatal: we default
-  // to "us" and continue, matching pair_keypad.py's behaviour.
+  // to "us" and continue.
   this->region_ = "us";
   {
     std::string url = std::string(ACCOUNT_BASE) + "/account/api/v1/user/userinfo";
@@ -343,16 +317,12 @@ bool CloudClient::list_keypads(std::vector<AccountKeypad> &out_keypads,
     return false;
   }
 
+  // Return every account device that has a MAC. We don't classify here — the
+  // pairing UI decides which of these are keypads purely from each device's
+  // live BLE advertisement (see keypad_advert.h).
   std::vector<AccountKeypad> picked;
   cJSON *item = nullptr;
   cJSON_ArrayForEach(item, items) {
-    cJSON *detail = cJSON_GetObjectItemCaseSensitive(item, "device_detail");
-    if (!cJSON_IsObject(detail)) continue;
-    cJSON *dt = cJSON_GetObjectItemCaseSensitive(detail, "device_type");
-    if (!cJSON_IsString(dt) || dt->valuestring == nullptr) continue;
-    const KeypadSku *sku = sku_lookup(dt->valuestring);
-    if (sku == nullptr) continue;
-
     cJSON *mac = cJSON_GetObjectItemCaseSensitive(item, "device_mac");
     if (!cJSON_IsString(mac) || mac->valuestring == nullptr) continue;
     cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "device_name");
@@ -361,18 +331,15 @@ bool CloudClient::list_keypads(std::vector<AccountKeypad> &out_keypads,
     kp.mac          = compact_mac(mac->valuestring);
     kp.mac_pretty   = pretty_mac(kp.mac);
     kp.name         = (cJSON_IsString(name) && name->valuestring) ? name->valuestring
-                                                                   : sku->display_name;
-    kp.device_type  = dt->valuestring;
-    kp.display_name = sku->display_name;
-    kp.family       = sku->family;
+                                                                   : kp.mac_pretty;
     picked.push_back(std::move(kp));
   }
   cJSON_Delete(root);
 
+  ESP_LOGI(TAG, "Account has %u device(s)", static_cast<unsigned>(picked.size()));
+
   this->keypads_cache_ = picked;
   out_keypads = std::move(picked);
-  ESP_LOGI(TAG, "Found %u keypads in account",
-           static_cast<unsigned>(out_keypads.size()));
   return true;
 }
 

@@ -28,8 +28,11 @@ knows it isn't talking to a real lock.
 
 ## Supported keypads
 
-The pairing wizard auto-detects the keypad family from the SwitchBot cloud and
-adapts the BLE protocol accordingly.
+The pairing wizard identifies the keypad model **from its BLE advertisement** —
+the same way the official [pySwitchbot](https://github.com/sblibs/pySwitchbot)
+library does — and adapts the pairing protocol accordingly. Detection does not
+depend on the cloud `device_type`/SKU string at all, so a keypad is found and
+paired even if its SKU is one SwitchBot hasn't shipped before.
 
 | Model | Protocol family | Status |
 |---|---|---|
@@ -37,6 +40,10 @@ adapts the BLE protocol accordingly.
 | SwitchBot Keypad Vision | Vision | ✅ **Tested** |
 | SwitchBot Keypad | Original | Supported — same protocol as Touch |
 | SwitchBot Keypad Vision Pro | Vision | Supported — same protocol as Vision |
+
+> Because the keypad is recognised from its live advertisement, keep it within
+> ~2 m and powered while you run the wizard — out-of-range devices won't be
+> listed.
 
 ## Quick start
 

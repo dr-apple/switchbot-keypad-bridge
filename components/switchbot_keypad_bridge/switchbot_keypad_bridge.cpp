@@ -378,7 +378,7 @@ bool SwitchbotKeypadBridge::prepare_ble_() {
 // ---------------------------------------------------------------------------
 
 void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
-  ESP_LOGV(TAG, "RX %zu bytes: %s", frame.size(),
+  ESP_LOGV(TAG, "RX WIRE %zu bytes: %s", frame.size(),
            format_hex_pretty(reinterpret_cast<const uint8_t *>(frame.data()), frame.size()).c_str());
 
   if (this->is_session_iv_request_(frame)) {
@@ -390,7 +390,7 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
       ESP_LOGI(TAG, "Token slot: 0x%02X", requested_slot);
       this->shared_slot_id_ = requested_slot;
     }
-    ESP_LOGD(TAG, "IV request: key_id=0x%02X", requested_slot);
+    ESP_LOGD(TAG, "IV request");
     this->send_session_iv_();
     return;
   }
@@ -445,9 +445,11 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
     return;  // error already logged
   }
 
+  ESP_LOGD(TAG, "RX %s", format_hex_pretty(plaintext, ct_len).c_str());
+
   DecodedCommand command;
   if (!this->decode_command_(plaintext, ct_len, command)) {
-    ESP_LOGD(TAG, "Unknown command payload: %s", format_hex_pretty(plaintext, ct_len).c_str());
+    ESP_LOGI(TAG, "Unhandled command: %s", format_hex_pretty(plaintext, ct_len).c_str());
     this->send_ack_(header);
     return;
   }
@@ -518,8 +520,9 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
       return;
 
     case CommandType::UNLOCK:
-      ESP_LOGI(TAG, "Unlock command received (method=%s, index=%d)",
-               unlock_method_name(command.method), command.credential_index);
+      ESP_LOGI(TAG, "Unlock: method=%s (0x%02X) index=%d",
+               unlock_method_name(command.method),
+               static_cast<uint8_t>(command.method), command.credential_index);
       this->lock_state_ = LockState::UNLOCKED;
       this->publish_unlock_(command.method, command.credential_index);
       this->send_encrypted_response_(header, RESPONSE_UNLOCK, sizeof(RESPONSE_UNLOCK));

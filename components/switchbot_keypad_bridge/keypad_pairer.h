@@ -2,7 +2,7 @@
 
 // Background task that drives a single keypad↔ESP pairing session.
 //
-// Mirrors tools/pair_keypad.py's `_run_pairing` step by step:
+// Runs the pairing handshake step by step:
 //   1. Connect as BLE central to the keypad
 //   2. Subscribe to its TX characteristic
 //   3. Negotiate a session IV (`57 00 00 00 0F 21 03 <key_id>`)
@@ -59,12 +59,13 @@ class KeypadPairer {
     std::string job_id;        // matches the value returned by start()
   };
 
-  // Arguments for a single pairing attempt.
+  // Arguments for a single pairing attempt. The protocol family is NOT passed
+  // in — the pairer reads it from the keypad's live BLE advertisement during
+  // discovery (keypad_advert.h), which is the single source of truth.
   struct Request {
     std::string                  keypad_mac;       // pretty form, e.g. "B0:E9:FE:..."
     int                          key_id{0};        // 0x88 / 0xC6 / ... from cloud
     std::vector<uint8_t>         key;              // 16-byte AES-CTR key from cloud
-    CloudClient::KeypadFamily    family{CloudClient::KeypadFamily::ORIGINAL};
     std::array<uint8_t, 16>      shared_token{};   // the random key we inject
     std::array<uint8_t, 6>       esp_mac{};        // our BLE peripheral address
   };

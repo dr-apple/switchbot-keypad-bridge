@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "esphome/core/log.h"
+#include "keypad_advert.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -20,8 +21,8 @@ constexpr const char *SERVICE_UUID = "cba20d00-224d-11e6-9fb8-0002a5d5c51b";
 constexpr const char *RX_CHAR_UUID = "cba20002-224d-11e6-9fb8-0002a5d5c51b";
 constexpr const char *TX_CHAR_UUID = "cba20003-224d-11e6-9fb8-0002a5d5c51b";
 
-// Per-family pairing dialect. Direct port of KEYPAD_PRESETS in
-// tools/pair_keypad.py.
+// Per-family pairing dialect: the BLE handshake constants that differ
+// between the Original and Vision keypad families.
 struct FamilyPreset {
   uint8_t shared_slot;
   uint8_t slot_init_nonce;
@@ -101,13 +102,27 @@ bool aes_ctr_xcrypt(const uint8_t *key, const uint8_t iv[16],
   return s == PSA_SUCCESS;
 }
 
+// Read the SwitchBot service-data blob from an advertisement (UUID 0xFD3D,
+// with the legacy 0x0D00 as a fallback). Empty when the device isn't
+// advertising SwitchBot service data.
+std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
+  static const NimBLEUUID U_FD3D(static_cast<uint16_t>(0xFD3D));
+  static const NimBLEUUID U_0D00(static_cast<uint16_t>(0x0D00));
+  std::string sd = adv->getServiceData(U_FD3D);
+  if (sd.empty()) sd = adv->getServiceData(U_0D00);
+  return std::vector<uint8_t>(sd.begin(), sd.end());
+}
+
 // Briefly scan and look up the advertising packet of the target MAC so
 // we can connect with the right address type. The keypad's first byte
 // (top 2 bits = 11) makes it a BLE "random static" address; without a
 // scan we'd have to guess between PUBLIC and RANDOM. Returns the
 // address with the discovered type on success, an empty address on
-// timeout.
-NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms) {
+// timeout. On success, `ident_out` carries the keypad model/family read
+// from the advertisement (pySwitchbot-style); `ident_out.is_keypad` is
+// false when the advert didn't match a known signature.
+NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms,
+                             KeypadIdent &ident_out) {
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->clearResults();
   scan->setActiveScan(true);
@@ -127,7 +142,11 @@ NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms
       if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
     }
     if (found == target) {
-      ESP_LOGI(TAG, "Found keypad %s (addr_type=%d)", mac_pretty.c_str(), adv->getAddressType());
+      const std::vector<uint8_t> sd = switchbot_service_data(adv);
+      ident_out = identify_keypad(sd.data(), sd.size());
+      ESP_LOGI(TAG, "Found keypad %s (addr_type=%d, advert=%s)",
+               mac_pretty.c_str(), adv->getAddressType(),
+               ident_out.is_keypad ? ident_out.display_name : "unrecognised");
       return adv->getAddress();
     }
   }
@@ -283,9 +302,8 @@ bool KeypadPairer::send_command_(NimBLERemoteCharacteristic *rx,
   if (!rx->writeValue(frame.data(), frame.size(), /*response=*/true)) {
     return false;
   }
-  // Wait briefly for the ACK notification. Like pair_keypad.py, we
-  // tolerate a missing ACK on most steps — the keypad doesn't always
-  // respond to the cosmetic commands.
+  // Wait briefly for the ACK notification. We tolerate a missing ACK on most
+  // steps — the keypad doesn't always respond to the cosmetic commands.
   xSemaphoreTake(this->ack_sem_, pdMS_TO_TICKS(800));
   return true;
 }
@@ -293,8 +311,6 @@ bool KeypadPairer::send_command_(NimBLERemoteCharacteristic *rx,
 // ── Task body ─────────────────────────────────────────────────────────────
 
 void KeypadPairer::execute_(Request &req) {
-  const FamilyPreset &preset = preset_for(req.family);
-
   // Step 0: discover the target via an active scan, then connect with
   // the correct address type. Without the scan we'd have to guess
   // between PUBLIC and RANDOM, and the BLE spec uses the top bits of
@@ -302,11 +318,23 @@ void KeypadPairer::execute_(Request &req) {
   // bytes, not the type. Scanning is also the natural check that the
   // keypad is in range right now.
   this->set_step_(0, STEP_LABELS[0]);
-  NimBLEAddress target = discover_target(req.keypad_mac, 6000);
+  KeypadIdent ident;
+  NimBLEAddress target = discover_target(req.keypad_mac, 6000, ident);
   if (target.isNull()) {
     this->set_failed_("Could not see the keypad over BLE. Keep it within 2 m and retry.");
     return;
   }
+
+  // The keypad model — and therefore the pairing dialect — comes solely from
+  // the live advertisement. If we can't identify it, we don't guess.
+  if (!ident.is_keypad) {
+    this->set_failed_("Could not identify the keypad from its advertisement. "
+                      "Reset it into pairing mode, keep it within 2 m and retry.");
+    return;
+  }
+  ESP_LOGI(TAG, "Pairing %s as %s family", ident.display_name,
+           ident.family == CloudClient::KeypadFamily::VISION ? "VISION" : "ORIGINAL");
+  const FamilyPreset &preset = preset_for(ident.family);
 
   // The keypad might currently be connected to our peripheral (server) role —
   // it sends IV requests to us as a SwitchBot Lock emulation. The BLE spec

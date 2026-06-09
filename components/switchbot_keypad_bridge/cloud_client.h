@@ -2,7 +2,7 @@
 
 // SwitchBot cloud client.
 //
-// Mirrors the four HTTPS calls `tools/pair_keypad.py` makes:
+// Makes four HTTPS calls:
 //
 //   POST  account.api.switchbot.net /account/api/v1/user/login
 //   POST  account.api.switchbot.net /account/api/v1/user/userinfo
@@ -12,7 +12,7 @@
 // The four endpoints together give us:
 //   - an account-wide bearer token
 //   - the user's home region ("us" / "eu" / ...)
-//   - the device list, filtered to keypads
+//   - the account device list (keypad detection happens later, over BLE)
 //   - the keypad's current `communicationKey` (the cloud-issued key the
 //     keypad uses to talk to its currently paired lock)
 //
@@ -28,19 +28,22 @@ namespace switchbot_keypad_bridge {
 
 class CloudClient {
  public:
-  // Pairing-protocol dialect. The SwitchBot Keypad firmware ships in
-  // two families with slightly different BLE handshakes; pair_keypad.py
-  // calls them "original" and "vision".
+  // Pairing-protocol dialect. The SwitchBot Keypad firmware ships in two
+  // families with slightly different BLE handshakes ("original" and "vision").
+  // Which family a keypad speaks is identified from its BLE advertisement
+  // (see keypad_advert.h), not from any cloud field.
   enum class KeypadFamily { ORIGINAL, VISION };
 
-  // Plain-data view of one keypad as returned by /wonder/device/v3/getdevice.
+  // Plain-data view of one account device as returned by
+  // /wonder/device/v3/getdevice. `list_keypads` returns every account device
+  // that carries a MAC. Whether a device is a keypad — and which family it
+  // speaks — is decided by the pairing UI / pairer from its live BLE
+  // advertisement (keypad_advert.h); the cloud only supplies identity (MAC,
+  // name) and, later, the communication key.
   struct AccountKeypad {
     std::string mac;          // hex, no separators: "B0E9FE612E75"
     std::string mac_pretty;   // "B0:E9:FE:61:2E:75"
     std::string name;         // user-set, e.g. "Keypad Vision 75"
-    std::string device_type;  // raw SKU as returned by the cloud
-    std::string display_name; // friendly model, e.g. "Keypad Vision"
-    KeypadFamily family{KeypadFamily::ORIGINAL};
   };
 
   // Authenticate against the SwitchBot account API. Captures the bearer
@@ -49,8 +52,10 @@ class CloudClient {
   bool login(const std::string &email, const std::string &password,
              std::string &error_out);
 
-  // Returns the list of keypads in the user's SwitchBot account.
-  // Successive calls are cached — pass `force_refresh = true` to bypass.
+  // Returns the user's SwitchBot account devices that carry a MAC (keypad
+  // candidates). The caller decides which are really keypads by checking each
+  // one's live BLE advertisement (keypad_advert.h). Successive calls are
+  // cached — pass `force_refresh = true` to bypass.
   bool list_keypads(std::vector<AccountKeypad> &out_keypads,
                     std::string &error_out, bool force_refresh = false);
 

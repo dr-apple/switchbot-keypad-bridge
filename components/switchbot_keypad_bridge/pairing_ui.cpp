@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "esphome/core/log.h"
+#include "keypad_advert.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -137,11 +138,29 @@ std::string extract_json_str(const std::string &body, const char *key) {
   return out;
 }
 
-// Active-scan for `duration_ms` and record the strongest RSSI seen for
-// each advertising address (upper-case, colon-separated). Lets the UI
-// flag which account keypads are actually reachable over BLE right now.
-std::map<std::string, int> scan_nearby(uint32_t duration_ms) {
-  std::map<std::string, int> seen;
+// One nearby BLE device: strongest RSSI seen plus its SwitchBot service-data
+// blob (so the UI can identify the keypad model the pySwitchbot way).
+struct NearbyDevice {
+  int rssi{0};
+  std::vector<uint8_t> svc_data;
+};
+
+// Read the SwitchBot service-data blob from an advertisement (UUID 0xFD3D,
+// with the legacy 0x0D00 as a fallback). Empty when not present.
+std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
+  static const NimBLEUUID U_FD3D(static_cast<uint16_t>(0xFD3D));
+  static const NimBLEUUID U_0D00(static_cast<uint16_t>(0x0D00));
+  std::string sd = adv->getServiceData(U_FD3D);
+  if (sd.empty()) sd = adv->getServiceData(U_0D00);
+  return std::vector<uint8_t>(sd.begin(), sd.end());
+}
+
+// Active-scan for `duration_ms` and record, for each advertising address
+// (upper-case, colon-separated), the strongest RSSI and its SwitchBot service
+// data. Lets the UI flag which account keypads are reachable right now and
+// identify their model straight from the advertisement.
+std::map<std::string, NearbyDevice> scan_nearby(uint32_t duration_ms) {
+  std::map<std::string, NearbyDevice> seen;
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->clearResults();
   scan->setActiveScan(true);
@@ -157,8 +176,11 @@ std::map<std::string, int> scan_nearby(uint32_t duration_ms) {
     }
     const int rssi = adv->getRSSI();
     auto it = seen.find(mac);
-    if (it == seen.end() || rssi > it->second) {
-      seen[mac] = rssi;
+    if (it == seen.end() || rssi > it->second.rssi) {
+      NearbyDevice &dev = seen[mac];
+      dev.rssi = rssi;
+      std::vector<uint8_t> sd = switchbot_service_data(adv);
+      if (!sd.empty()) dev.svc_data = std::move(sd);
     }
   }
   scan->clearResults();
@@ -200,31 +222,38 @@ esp_err_t PairingUi::handle_keypads_(httpd_req_t *req) {
     return reply_error_(req, "502 Bad Gateway", err);
   }
 
-  // Cross-reference the account keypads against a fresh BLE scan so the
-  // UI can show which ones are in range — and how strong the signal is.
-  const std::map<std::string, int> nearby = scan_nearby(4000);
+  // Cross-reference the account devices against a fresh BLE scan: this both
+  // shows which ones are in range (and how strong the signal is) and identifies
+  // the keypad model straight from the advertisement (pySwitchbot-style).
+  const std::map<std::string, NearbyDevice> nearby = scan_nearby(4000);
 
   std::string out = "[";
-  for (size_t i = 0; i < keypads.size(); ++i) {
-    const auto &k = keypads[i];
-    if (i != 0) out += ",";
+  unsigned shown = 0;
+  for (const auto &k : keypads) {
     const auto hit = nearby.find(k.mac_pretty);
-    const bool online = hit != nearby.end();
+    if (hit == nearby.end() || hit->second.svc_data.empty()) continue;
+
+    // A device is a keypad only if its live advertisement matches a known
+    // SwitchBot keypad signature. Everything else (locks, bots, hubs, …) and
+    // any out-of-range device is skipped — detection is BLE-only.
+    const KeypadIdent ident = identify_keypad(hit->second.svc_data.data(),
+                                              hit->second.svc_data.size());
+    if (!ident.is_keypad) continue;
+
+    if (shown++ != 0) out += ",";
     out += R"json({"mac":")json";
     out += json_escape(k.mac_pretty);
     out += R"json(","name":")json";
     out += json_escape(k.name);
     out += R"json(","model":")json";
-    out += json_escape(k.device_type);
-    out += R"json(","online":)json";
-    out += online ? "true" : "false";
-    out += R"json(,"rssi":)json";
-    out += online ? std::to_string(hit->second) : "null";
+    out += json_escape(ident.display_name);
+    out += R"json(","online":true,"rssi":)json";
+    out += std::to_string(hit->second.rssi);
     out += "}";
   }
   out += "]";
-  ESP_LOGI(TAG, "GET /api/keypads -> %u keypad(s), %u nearby",
-           static_cast<unsigned>(keypads.size()),
+  ESP_LOGI(TAG, "GET /api/keypads -> %u keypad(s) of %u account device(s), %u nearby",
+           shown, static_cast<unsigned>(keypads.size()),
            static_cast<unsigned>(nearby.size()));
   return reply_json_(req, out.c_str());
 }
@@ -258,7 +287,9 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
     return reply_error_(req, "401 Unauthorized", "Sign in first.");
   }
 
-  // Locate the keypad in the cached list so we know its family.
+  // Confirm the MAC belongs to this account (and grab its pretty form + name).
+  // The protocol family is determined later by the pairer from the keypad's
+  // live BLE advertisement.
   std::vector<CloudClient::AccountKeypad> keypads;
   std::string err;
   if (!self->cloud_.list_keypads(keypads, err)) {
@@ -290,7 +321,6 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   kr.keypad_mac  = found->mac_pretty;
   kr.key_id     = static_cast<int>(std::strtol(key_id_hex.c_str(), nullptr, 16));
   kr.key        = std::move(key_bytes);
-  kr.family     = found->family;
   kr.shared_token = self->shared_key_;
   kr.esp_mac = esp_ble_mac();
 
