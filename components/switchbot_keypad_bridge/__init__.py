@@ -5,9 +5,10 @@ SwitchBot Keypad can deliver encrypted unlock/lock commands. The bridge
 decrypts the frames in-place using mbed-TLS / PSA Crypto and exposes the
 decoded commands through two surfaces:
 
-- A standard ESPHome ``event`` entity (``Lock``/``Unlock`` types).
-- ESPHome automation triggers (``on_lock`` / ``on_unlock``) which receive
-  the unlock ``method`` and credential ``index`` as arguments.
+- A standard ESPHome ``event`` entity (``Lock``/``Unlock``/``Doorbell`` types).
+- ESPHome automation triggers (``on_lock`` / ``on_unlock`` / ``on_doorbell``).
+  ``on_unlock`` receives the unlock ``method`` and credential ``index`` as
+  arguments; the others take none.
 
 The AES session key is generated on the device on first boot and kept in
 NVS — it is never part of the YAML configuration.
@@ -43,6 +44,7 @@ CONF_KEYPAD = "keypad"
 CONF_UNPAIR_BUTTON = "unpair_button"
 CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
+CONF_ON_DOORBELL = "on_doorbell"
 CONF_PAIRING_UI = "pairing_ui"
 
 # Auto-generated id for the progmem array that carries the embedded UI.
@@ -63,6 +65,9 @@ LockTrigger = switchbot_keypad_bridge_ns.class_(
 )
 UnlockTrigger = switchbot_keypad_bridge_ns.class_(
     "UnlockTrigger", automation.Trigger.template(cg.std_string, cg.int_)
+)
+DoorbellTrigger = switchbot_keypad_bridge_ns.class_(
+    "DoorbellTrigger", automation.Trigger.template()
 )
 
 
@@ -103,6 +108,9 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_ON_UNLOCK): automation.validate_automation(
             {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(UnlockTrigger)}
+        ),
+        cv.Optional(CONF_ON_DOORBELL): automation.validate_automation(
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DoorbellTrigger)}
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -158,7 +166,9 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     if keypad_conf := config.get(CONF_KEYPAD_ACTION):
-        keypad = await event.new_event(keypad_conf, event_types=["Lock", "Unlock"])
+        keypad = await event.new_event(
+            keypad_conf, event_types=["Lock", "Unlock", "Doorbell"]
+        )
         cg.add(var.set_keypad_event(keypad))
 
     if keypad_sensor_conf := config.get(CONF_KEYPAD):
@@ -195,6 +205,10 @@ async def to_code(config):
         await automation.build_automation(
             trig, [(cg.std_string, "method"), (cg.int_, "index")], trig_conf
         )
+
+    for trig_conf in config.get(CONF_ON_DOORBELL, []):
+        trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trig, [], trig_conf)
 
     # NimBLE C++ wrapper, pulled as ESP-IDF managed component (no Python deps).
     add_idf_component(

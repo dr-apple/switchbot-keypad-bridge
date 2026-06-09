@@ -21,5 +21,12 @@ class UnlockTrigger : public Trigger<std::string, int> {
   }
 };
 
+class DoorbellTrigger : public Trigger<> {
+ public:
+  explicit DoorbellTrigger(SwitchbotKeypadBridge *parent) {
+    parent->add_on_doorbell_callback([this]() { this->trigger(); });
+  }
+};
+
 }  // namespace switchbot_keypad_bridge
 }  // namespace esphome

@@ -37,9 +37,6 @@ switchbot_keypad_bridge:
   unpair_button:
     name: "Unpair"
 
-  # on_lock:
-  #   - logger.log: "Locked"
-
   on_unlock:
     # method: "pin" | "fingerprint" | "nfc" | "face" | "unknown"   index: credential slot
     - homeassistant.event:
@@ -47,3 +44,9 @@ switchbot_keypad_bridge:
         data:
           method: !lambda 'return method;'
           index: !lambda 'return to_string(index);'
+  
+  # on_lock:
+  #   - logger.log: "Locked"
+
+  # on_doorbell:
+  #   - logger.log: "Doorbell pressed"

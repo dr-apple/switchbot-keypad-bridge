@@ -36,6 +36,9 @@ constexpr uint8_t ADVERTISING_MFG_DATA[] = {0x27, 0x09, 0x00, 0x10,
 constexpr uint8_t FRAME_LOCK[8]              = {0x0F, 0x4E, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00};
 constexpr uint8_t FRAME_ACTION[4]            = {0x0F, 0x4E, 0x01, 0x03};
 constexpr uint8_t FRAME_STATE_POLL_PREFIX[3] = {0x0F, 0x4F, 0x81};
+// Doorbell press (Keypad Vision). A short, distinct 2-byte opcode the keypad
+// sends on the shared slot when its doorbell button is pressed.
+constexpr uint8_t FRAME_DOORBELL[2]          = {0x01, 0x03};
 
 // Encrypted response payloads sent back to the keypad on lock/unlock.
 constexpr uint8_t RESPONSE_LOCK[5]   = {0x90, 0x0A, 0x7F, 0x7F, 0x00};
@@ -49,7 +52,6 @@ constexpr uint8_t STATE_PAYLOAD_TAIL[13] = {0x08, 0x08, 0x41, 0x00, 0x00, 0x00, 
 constexpr uint8_t  PROTOCOL_MAGIC      = 0x57;
 constexpr size_t   ENCRYPTED_HEADER    = 4;     // [0x57, key_id, seq_a, seq_b]
 constexpr size_t   MAX_PAYLOAD_LEN     = 32;
-constexpr size_t   MIN_PAYLOAD_LEN     = 4;
 
 // Session IV negotiation: first frame received after connect.
 // Shape: 57 00 00 00 0F 21 03 <key_id>
@@ -188,7 +190,7 @@ void SwitchbotKeypadBridge::setup() {
   // so the very first pairing needs no button press.
   if (!have_keypad) {
     if (this->pairing_ui_.start()) {
-      ESP_LOGI(TAG, "No keypad paired — pairing mode active on http://<device>/");
+      ESP_LOGI(TAG, "No keypad paired — starting pairing mode");
     } else {
       ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
     }
@@ -218,7 +220,7 @@ void SwitchbotKeypadBridge::loop() {
     // loop() runs on the main task.
     this->set_timeout(2000, [this]() {
       this->pairing_ui_.stop();
-      ESP_LOGI(TAG, "Pairing UI stopped — pairing complete");
+      ESP_LOGI(TAG, "Pairing UI stopped");
     });
   }
 
@@ -273,7 +275,7 @@ void SwitchbotKeypadBridge::unpair() {
   // Re-enter pairing mode straight away with the rotated key.
   this->pairing_ui_.set_shared_key(this->shared_key_);
   if (this->pairing_ui_.start()) {
-    ESP_LOGI(TAG, "Unpaired — pairing mode active on http://<device>/");
+    ESP_LOGI(TAG, "Unpaired — re-entering pairing mode");
   } else {
     ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
   }
@@ -429,7 +431,7 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
   }
 
   const size_t ct_len = frame.size() - ENCRYPTED_HEADER;
-  if (ct_len < MIN_PAYLOAD_LEN || ct_len > MAX_PAYLOAD_LEN) {
+  if (ct_len > MAX_PAYLOAD_LEN) {
     ESP_LOGW(TAG, "Dropping frame with invalid payload length: %zu", ct_len);
     return;
   }
@@ -494,6 +496,11 @@ bool SwitchbotKeypadBridge::decode_command_(const uint8_t *plaintext, size_t len
     out.type = CommandType::STATE_POLL;
     return true;
   }
+  if (length == sizeof(FRAME_DOORBELL) &&
+      std::memcmp(plaintext, FRAME_DOORBELL, sizeof(FRAME_DOORBELL)) == 0) {
+    out.type = CommandType::DOORBELL;
+    return true;
+  }
   if (length >= 8 && std::memcmp(plaintext, FRAME_ACTION, sizeof(FRAME_ACTION)) == 0 &&
       plaintext[UNLOCK_MARKER_OFFSET] == UNLOCK_MARKER) {
     out.type = CommandType::UNLOCK;
@@ -515,7 +522,7 @@ bool SwitchbotKeypadBridge::decode_command_(const uint8_t *plaintext, size_t len
 void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const DecodedCommand &command) {
   switch (command.type) {
     case CommandType::LOCK:
-      ESP_LOGI(TAG, "Lock command received");
+      ESP_LOGI(TAG, "Lock");
       this->lock_state_ = LockState::LOCKED;
       this->publish_lock_();
       this->send_encrypted_response_(header, RESPONSE_LOCK, sizeof(RESPONSE_LOCK));
@@ -533,6 +540,13 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
     case CommandType::STATE_POLL:
       ESP_LOGV(TAG, "State poll");
       this->handle_state_poll_(header);
+      return;
+
+    case CommandType::DOORBELL:
+      ESP_LOGI(TAG, "Doorbell");
+      this->publish_doorbell_();
+      // No lock-state change; the keypad only needs the transport ACK.
+      this->send_ack_(header);
       return;
 
     case CommandType::UNKNOWN:
@@ -672,6 +686,13 @@ void SwitchbotKeypadBridge::publish_unlock_(UnlockMethod method, int index) {
     this->keypad_event_->trigger("Unlock");
   }
   this->on_unlock_callbacks_.call(std::string(method_str), index);
+}
+
+void SwitchbotKeypadBridge::publish_doorbell_() {
+  if (this->keypad_event_ != nullptr) {
+    this->keypad_event_->trigger("Doorbell");
+  }
+  this->on_doorbell_callbacks_.call();
 }
 
 }  // namespace switchbot_keypad_bridge

@@ -74,6 +74,9 @@ class SwitchbotKeypadBridge : public Component {
   void add_on_unlock_callback(std::function<void(std::string, int)> &&callback) {
     this->on_unlock_callbacks_.add(std::move(callback));
   }
+  void add_on_doorbell_callback(std::function<void()> &&callback) {
+    this->on_doorbell_callbacks_.add(std::move(callback));
+  }
 
  protected:
   class ServerCallbacks;
@@ -91,6 +94,7 @@ class SwitchbotKeypadBridge : public Component {
     LOCK,
     UNLOCK,
     STATE_POLL,
+    DOORBELL,
   };
 
   // 4-byte transport header echoed back on every encrypted exchange.
@@ -150,6 +154,7 @@ class SwitchbotKeypadBridge : public Component {
 
   void publish_lock_();
   void publish_unlock_(UnlockMethod method, int index);
+  void publish_doorbell_();
 
   // ----- BLE handles ---------------------------------------------------------
 
@@ -187,6 +192,7 @@ class SwitchbotKeypadBridge : public Component {
   event::Event *keypad_event_{nullptr};
   CallbackManager<void()> on_lock_callbacks_{};
   CallbackManager<void(std::string, int)> on_unlock_callbacks_{};
+  CallbackManager<void()> on_doorbell_callbacks_{};
 
   // ----- User configuration --------------------------------------------------
 
