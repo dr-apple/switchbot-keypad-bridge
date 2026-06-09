@@ -32,6 +32,8 @@ struct FamilyPreset {
   size_t capabilities_probe_len;
   const uint8_t *finalize_tail;
   size_t finalize_tail_len;
+  const uint8_t *enable_doorbell;     // may be nullptr (Vision-only feature)
+  size_t enable_doorbell_len;
 };
 
 constexpr uint8_t ORIGINAL_ENTER_PAIRING[]   = {0x0f, 0x52, 0x01, 0x07, 0x00};
@@ -41,17 +43,25 @@ constexpr uint8_t VISION_ENTER_PAIRING[]     = {0x0f, 0x53, 0x01, 0x07};
 constexpr uint8_t VISION_CAPABILITIES_PROBE[]= {0x0f, 0x53, 0x07, 0x03};
 constexpr uint8_t VISION_FINALIZE_TAIL[]     = {0x04, 0x04, 0x01, 0x05, 0x08, 0x09};
 
+// Doorbell-enable setting toggle (byte[4] = 0x02 enable / 0x01 disable),
+// captured from the official app. The app only exposes the toggle once a lock
+// is bound to the account, but the keypad firmware accepts the plain setting
+// write unconditionally. Vision-family only — Original/Touch have no doorbell.
+constexpr uint8_t VISION_ENABLE_DOORBELL[]   = {0x0f, 0x52, 0x01, 0x09, 0x02, 0x01, 0x01};
+
 constexpr FamilyPreset ORIGINAL_PRESET = {
     0x88, 0x69,
     ORIGINAL_ENTER_PAIRING,    sizeof(ORIGINAL_ENTER_PAIRING),
     nullptr,                   0,
     ORIGINAL_FINALIZE_TAIL,    sizeof(ORIGINAL_FINALIZE_TAIL),
+    nullptr,                   0,
 };
 constexpr FamilyPreset VISION_PRESET = {
     0xC6, 0x80,
     VISION_ENTER_PAIRING,      sizeof(VISION_ENTER_PAIRING),
     VISION_CAPABILITIES_PROBE, sizeof(VISION_CAPABILITIES_PROBE),
     VISION_FINALIZE_TAIL,      sizeof(VISION_FINALIZE_TAIL),
+    VISION_ENABLE_DOORBELL,    sizeof(VISION_ENABLE_DOORBELL),
 };
 
 const FamilyPreset &preset_for(CloudClient::KeypadFamily f) {
@@ -239,7 +249,7 @@ void KeypadPairer::set_running_(uint8_t total, const std::string &job_id) {
 }
 
 void KeypadPairer::set_step_(uint8_t step, const char *msg) {
-  ESP_LOGI(TAG, "step %u/%u: %s", static_cast<unsigned>(step + 1),
+  ESP_LOGI(TAG, "Step %u/%u: %s", static_cast<unsigned>(step + 1),
            static_cast<unsigned>(TOTAL_STEPS), msg);
   std::lock_guard<std::mutex> lk(this->mu_);
   this->status_.step    = step;
@@ -247,7 +257,7 @@ void KeypadPairer::set_step_(uint8_t step, const char *msg) {
 }
 
 void KeypadPairer::set_success_() {
-  ESP_LOGI(TAG, "pairing successful");
+  ESP_LOGI(TAG, "Pairing successful");
   std::lock_guard<std::mutex> lk(this->mu_);
   this->status_.state   = State::SUCCESS;
   this->status_.step    = this->status_.total;
@@ -256,7 +266,7 @@ void KeypadPairer::set_success_() {
 }
 
 void KeypadPairer::set_failed_(const std::string &err) {
-  ESP_LOGW(TAG, "pairing failed: %s", err.c_str());
+  ESP_LOGW(TAG, "Pairing failed: %s", err.c_str());
   std::lock_guard<std::mutex> lk(this->mu_);
   this->status_.state   = State::FAILED;
   this->status_.error   = err;
@@ -465,6 +475,13 @@ void KeypadPairer::execute_(Request &req) {
   }
   uint8_t finalize2[] = {0x0f, 0x53, 0x01, 0x06};
   this->send_command_(rx, finalize2, sizeof(finalize2));
+
+  // Enable the doorbell by default while we hold an authenticated session
+  // (Vision only). Best-effort: an unsupported keypad just ACKs and ignores it.
+  if (preset.enable_doorbell != nullptr) {
+    ESP_LOGI(TAG, "Enabling doorbell button");
+    this->send_command_(rx, preset.enable_doorbell, preset.enable_doorbell_len);
+  }
 
   // Cleanup.
   client->disconnect();
