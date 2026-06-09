@@ -41,7 +41,7 @@ switchbot_keypad_bridge:
   #   - logger.log: "Locked"
 
   on_unlock:
-    # method: "pin" | "fingerprint" | "face" | "unknown"   index: credential slot
+    # method: "pin" | "fingerprint" | "nfc" | "face" | "unknown"   index: credential slot
     - homeassistant.event:
         event: esphome.switchbot_keypad_unlock
         data:

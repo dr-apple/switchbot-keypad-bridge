@@ -74,6 +74,8 @@ const char *unlock_method_name(UnlockMethod method) {
       return "fingerprint";
     case UnlockMethod::PIN:
       return "pin";
+    case UnlockMethod::NFC:
+      return "nfc";
     case UnlockMethod::FACE:
       return "face";
     default:

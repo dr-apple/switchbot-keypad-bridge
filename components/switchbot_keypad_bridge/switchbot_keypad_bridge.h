@@ -41,6 +41,7 @@ constexpr size_t KEYPAD_NAME_MAX = 48;
 enum class UnlockMethod : uint8_t {
   UNKNOWN = 0x00,
   PIN = 0x04,
+  NFC = 0x08,
   FINGERPRINT = 0x0C,
   FACE = 0x18,
 };

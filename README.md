@@ -1,7 +1,7 @@
 # SwitchBot Keypad Bridge
 
 > Use a **SwitchBot Keypad without a SwitchBot Lock** — pair it straight to an
-> ESP32 and turn every PIN, fingerprint, and face unlock into a Home Assistant event.
+> ESP32 and turn every PIN, fingerprint, NFC, and face unlock into a Home Assistant event.
 
 <p align="center">
   <img src="docs/pairing.gif" alt="Pairing a SwitchBot Keypad through the on-device wizard" width="320">
@@ -20,7 +20,7 @@ knows it isn't talking to a real lock.
 - 📲 **On-device pairing wizard** — sign in to your SwitchBot account, pick the
   keypad, done. No Python script, no laptop, no BLE sniffing.
 - 👤 **Knows who unlocked** — every unlock carries the method (`pin` /
-  `fingerprint` / `face`) and the credential slot, so you can act per user.
+  `fingerprint` / `nfc` / `face`) and the credential slot, so you can act per user.
 - 🔐 **Keys never leave the device** — the AES-128 session key is generated on
   the ESP32 and stored in NVS; it is never in your YAML or git.
 - 🧩 **Pure ESPHome** — exposes a standard `event` entity plus `on_lock` /
@@ -96,11 +96,11 @@ Every `on_unlock` trigger carries two values:
 
 | Parameter | Type | Values |
 |---|---|---|
-| `method` | `std::string` | `"pin"`, `"fingerprint"`, `"face"`, or `"unknown"` |
+| `method` | `std::string` | `"pin"`, `"fingerprint"`, `"nfc"`, `"face"`, or `"unknown"` |
 | `index` | `int` | Numeric ID of the credential slot |
 
 **`index` is the slot the SwitchBot app assigns automatically when you add a
-PIN, fingerprint, or face** — the first credential gets index `0`, the second
+PIN, fingerprint, NFC card, or face** — the first credential gets index `0`, the second
 `1`, and so on. Combined with `method`, it tells you exactly which family member
 is at the door.
 
