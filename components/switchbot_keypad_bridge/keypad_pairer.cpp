@@ -393,13 +393,23 @@ void KeypadPairer::execute_(Request &req) {
     this->set_failed_("enter_pairing rejected.");
     return;
   }
+  // Best-effort pair of frames: the capabilities probe is informational and
+  // the prep preamble is tolerated missing by every keypad we've captured.
   if (preset.capabilities_probe != nullptr) {
     this->send_command_(rx, preset.capabilities_probe, preset.capabilities_probe_len);
   }
   uint8_t prep[] = {0x06, 0x03};
   this->send_command_(rx, prep, sizeof(prep));
+  // slot_init is NOT best-effort: it opens the slot the shared key is written
+  // into on steps 4-5. Carrying on after a failed write would report SUCCESS
+  // for a keypad that never works.
   uint8_t slot_init[] = {0x0F, 0x20, 0x03, preset.shared_slot, preset.slot_init_nonce};
-  this->send_command_(rx, slot_init, sizeof(slot_init));
+  if (!this->send_command_(rx, slot_init, sizeof(slot_init))) {
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    this->set_failed_("Could not open the keypad's key slot.");
+    return;
+  }
 
   // Step 4: shared_key chunk 1.
   uint8_t tok1[5 + 8];
