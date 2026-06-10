@@ -21,6 +21,7 @@
 #include "esphome/core/preferences.h"
 
 #include "lock_protocol.h"
+#include "lock_session.h"
 #include "nimble_compat.h"
 #include "pairing_ui.h"
 
@@ -30,8 +31,10 @@ namespace switchbot_keypad_bridge {
 // Upper bound (including the trailing NUL) on the persisted keypad name.
 constexpr size_t KEYPAD_NAME_MAX = 48;
 
-// UnlockMethod / CommandType / DecodedCommand and the frame decoding live in
-// lock_protocol.h — the transport-free half of the protocol.
+// The protocol layers live next door: lock_protocol.h decodes plaintext
+// frames, lock_session.h owns the encrypted-session state machine (IV,
+// anti-replay, transport crypto). This component is the NimBLE transport
+// and the ESPHome-facing business logic on top of them.
 
 // ── Concurrency model ───────────────────────────────────────────────────────
 // Four execution contexts touch this component. The rule of thumb: only the
@@ -96,13 +99,6 @@ class SwitchbotKeypadBridge : public Component {
     UNLOCKED = 0x91,
   };
 
-  // 4-byte transport header echoed back on every encrypted exchange.
-  struct FrameHeader {
-    uint8_t key_id;
-    uint8_t seq_a;
-    uint8_t seq_b;
-  };
-
   // Identity of the paired keypad, persisted to NVS at pairing time so the
   // battery scan can match its advertisement after a reboot. `valid == 0`
   // for keypads paired before this field existed — the scan then learns the
@@ -127,9 +123,9 @@ class SwitchbotKeypadBridge : public Component {
 
   // ----- BLE write handling --------------------------------------------------
 
+  // Validation, decryption and decoding live in LockSession; the bridge
+  // dispatches the resulting Action and owns the business logic.
   void on_rx_frame_(const std::string &frame);
-  bool is_session_iv_request_(const std::string &frame) const;
-  void send_session_iv_();
 
   void handle_command_(const FrameHeader &header, const DecodedCommand &command);
   void handle_state_poll_(const FrameHeader &header);
@@ -139,18 +135,6 @@ class SwitchbotKeypadBridge : public Component {
   void send_ack_(const FrameHeader &header);
   void send_encrypted_response_(const FrameHeader &header, const uint8_t *plaintext, size_t length);
   void notify_(const uint8_t *data, size_t length);
-
-  // ----- Crypto (AES-CTR is symmetric, so a single primitive covers both ways) -
-
-  bool aes_ctr_xcrypt_(const uint8_t *input, size_t length, uint8_t *output);
-  void rotate_session_iv_();
-
-  // ----- Anti-replay ---------------------------------------------------------
-
-  void reset_session_state_();
-  void clear_replay_history_();
-  bool is_replayed_ciphertext_(const uint8_t *ciphertext, size_t length) const;
-  void record_ciphertext_(const uint8_t *ciphertext, size_t length);
 
   // ----- Eventing ------------------------------------------------------------
 
@@ -215,11 +199,6 @@ class SwitchbotKeypadBridge : public Component {
   std::array<uint8_t, 16> shared_key_{};
   ESPPreferenceObject shared_key_pref_;
   ESPPreferenceObject keypad_name_pref_;
-  // Token-slot key_id the keypad uses post-pairing. Auto-learned from the
-  // IV-request frame the keypad sends as the first message of every session
-  // (Original/Touch=0x88, Vision/Vision Pro=0xC6, …). 0x00 = not yet seen;
-  // no encrypted frame is accepted until the IV handshake has set it.
-  uint8_t shared_slot_id_{0x00};
 
   // ----- Runtime state -------------------------------------------------------
 
@@ -228,21 +207,9 @@ class SwitchbotKeypadBridge : public Component {
   psa_key_id_t aes_key_handle_{PSA_KEY_ID_NULL};
   LockState lock_state_{LockState::LOCKED};
 
-  // 20-byte session IV response: [0x01, 0x00, 0x00, 0x00, IV(16)].
-  // The trailing 16 bytes are also used as the AES-CTR IV for the live session.
-  std::array<uint8_t, 20> session_iv_response_{0x01, 0x00, 0x00, 0x00};
-
-  // Per-session anti-replay state. Reset on connect, disconnect, and on
-  // every IV re-negotiation.
-  static constexpr size_t REPLAY_HISTORY_SIZE = 8;
-  static constexpr size_t MAX_REPLAY_PAYLOAD = 32;
-  struct ReplayEntry {
-    std::array<uint8_t, MAX_REPLAY_PAYLOAD> data{};
-    size_t length{0};
-  };
-  std::array<ReplayEntry, REPLAY_HISTORY_SIZE> replay_history_{};
-  size_t replay_head_{0};
-  bool iv_established_{false};
+  // Per-connection encrypted-session state (token slot, IV, anti-replay,
+  // transport crypto). Only ever touched from the main task.
+  LockSession session_{};
 
   // ----- Keypad battery state --------------------------------------------------
 
