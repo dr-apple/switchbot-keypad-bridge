@@ -1,6 +1,5 @@
 #include "cloud_client.h"
 
-#include <cctype>
 #include <cstring>
 #include <ctime>
 
@@ -12,6 +11,7 @@
 #include <freertos/task.h>
 
 #include "esphome/core/log.h"
+#include "mac_utils.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -31,38 +31,6 @@ constexpr const char *ACCOUNT_BASE = "https://account.api.switchbot.net";
 // protocol family it speaks — is decided solely from its BLE advertisement, the
 // way the official pySwitchbot library does it (see keypad_advert.h). This keeps
 // us from chasing SwitchBot's ever-growing list of device_type codes.
-
-// Convert "B0E9FE612E75" → "B0:E9:FE:61:2E:75". Idempotent on already-
-// pretty input. Defensive on odd-length strings (returns input as-is).
-std::string pretty_mac(const std::string &raw) {
-  std::string compact;
-  compact.reserve(12);
-  for (char c : raw) {
-    if (c == ':' || c == '-')
-      continue;
-    compact.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-  }
-  if (compact.size() != 12) return raw;
-  std::string out;
-  out.reserve(17);
-  for (size_t i = 0; i < 12; i += 2) {
-    if (!out.empty()) out.push_back(':');
-    out.push_back(compact[i]);
-    out.push_back(compact[i + 1]);
-  }
-  return out;
-}
-
-std::string compact_mac(const std::string &any) {
-  std::string out;
-  out.reserve(12);
-  for (char c : any) {
-    if (c == ':' || c == '-')
-      continue;
-    out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
 
 // Build the account-login request body. cJSON handles escaping, so a
 // password containing `"` or `\` is sent correctly rather than producing

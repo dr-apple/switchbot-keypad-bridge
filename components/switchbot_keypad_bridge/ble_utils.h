@@ -2,9 +2,9 @@
 
 // Small NimBLE helpers shared by the bridge, the pairer and the pairing UI.
 //
-// keypad_advert.h is deliberately NimBLE-free; everything here is the glue
-// between NimBLE types and that raw-bytes world (service-data extraction,
-// address formats, common scan parameters).
+// keypad_advert.h and mac_utils.h are deliberately NimBLE-free; everything
+// here is the glue between NimBLE types and that raw-bytes world
+// (service-data extraction, address bytes, common scan parameters).
 
 #include "nimble_compat.h"
 
@@ -20,15 +20,8 @@ namespace switchbot_keypad_bridge {
 // with the legacy 0x0D00 as a fallback). Empty when not present.
 std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv);
 
-// Upper-cased copy of a MAC string, for case-insensitive comparisons
-// ("b0:e9:fe:…" → "B0:E9:FE:…").
-std::string upper_mac(std::string mac);
-
 // Address bytes in big-endian (printed) order — NimBLE stores them reversed.
 std::array<uint8_t, 6> addr_bytes(const NimBLEAddress &addr);
-
-// Parse "B0:E9:FE:11:22:33" (any case) into 6 big-endian bytes.
-bool parse_mac_pretty(const std::string &mac, uint8_t out[6]);
 
 // Apply the scan parameters every SwitchBot scan in this project uses, and
 // drop any previous results. Active scanning is required — the keypad's

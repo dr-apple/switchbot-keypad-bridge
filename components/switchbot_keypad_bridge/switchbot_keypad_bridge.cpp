@@ -14,6 +14,7 @@
 #include "aes_ctr.h"
 #include "ble_utils.h"
 #include "keypad_advert.h"
+#include "mac_utils.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
