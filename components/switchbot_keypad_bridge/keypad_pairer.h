@@ -14,15 +14,7 @@
 // Spawned once per pairing attempt; the HTTP handler polls `status()`
 // at ~2 Hz from the UI's `/api/pair/status`.
 
-#include <NimBLEDevice.h>
-
-// NimBLE leaks LOG_LEVEL_* macros that collide with ESPHome's enum.
-#undef LOG_LEVEL_NONE
-#undef LOG_LEVEL_ERROR
-#undef LOG_LEVEL_WARN
-#undef LOG_LEVEL_INFO
-#undef LOG_LEVEL_DEBUG
-#undef LOG_LEVEL_CRITICAL
+#include "nimble_compat.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>

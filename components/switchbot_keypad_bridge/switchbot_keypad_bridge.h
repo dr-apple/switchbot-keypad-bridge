@@ -1,6 +1,5 @@
 #pragma once
 
-#include <NimBLEDevice.h>
 #include <psa/crypto.h>
 
 #include <array>
@@ -22,17 +21,8 @@
 #include "esphome/core/preferences.h"
 
 #include "lock_protocol.h"
+#include "nimble_compat.h"
 #include "pairing_ui.h"
-
-// NimBLE's log_common.h defines LOG_LEVEL_* as plain macros, which collide
-// with identically-named members of ESPHome enums included downstream.
-// ESPHome uses ESPHOME_LOG_LEVEL_* for its own logging, so these undefs are safe.
-#undef LOG_LEVEL_NONE
-#undef LOG_LEVEL_ERROR
-#undef LOG_LEVEL_WARN
-#undef LOG_LEVEL_INFO
-#undef LOG_LEVEL_DEBUG
-#undef LOG_LEVEL_CRITICAL
 
 namespace esphome {
 namespace switchbot_keypad_bridge {

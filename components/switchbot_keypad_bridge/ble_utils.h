@@ -6,15 +6,7 @@
 // between NimBLE types and that raw-bytes world (service-data extraction,
 // address formats, common scan parameters).
 
-#include <NimBLEDevice.h>
-
-// NimBLE leaks LOG_LEVEL_* macros that collide with ESPHome's enum.
-#undef LOG_LEVEL_NONE
-#undef LOG_LEVEL_ERROR
-#undef LOG_LEVEL_WARN
-#undef LOG_LEVEL_INFO
-#undef LOG_LEVEL_DEBUG
-#undef LOG_LEVEL_CRITICAL
+#include "nimble_compat.h"
 
 #include <array>
 #include <cstdint>
