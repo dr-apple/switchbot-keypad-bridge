@@ -42,7 +42,8 @@ class PairingUi {
   // slot during pairing.
   void set_shared_key(const std::array<uint8_t, 16> &key) { this->shared_key_ = key; }
 
-  // The embedded UI page, baked into flash by codegen (see __init__.py).
+  // The embedded UI page, gzip-compressed and baked into flash by codegen
+  // (see __init__.py); served verbatim with Content-Encoding: gzip.
   // Not NUL-terminated, so the length is carried alongside the pointer.
   void set_html(const uint8_t *html, size_t len) {
     this->html_ = html;

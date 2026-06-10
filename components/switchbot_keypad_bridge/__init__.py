@@ -16,6 +16,7 @@ NVS — it is never part of the YAML configuration.
 
 from __future__ import annotations
 
+import gzip
 import logging
 from pathlib import Path
 
@@ -218,10 +219,12 @@ async def to_code(config):
     cg.add_define("USE_WEBSERVER")
     cg.add_define("USE_WEBSERVER_PORT", 80)
 
-    # Bake the pairing wizard's HTML straight into the firmware image as a
-    # PROGMEM array. `pairing_ui.html` is the single source of truth — no
-    # generated header to commit, no build step to run by hand.
-    html_bytes = PAIRING_UI_HTML.read_bytes()
+    # Bake the pairing wizard's HTML into the firmware image as a
+    # gzip-compressed PROGMEM array (~4x smaller; served with
+    # Content-Encoding: gzip). `pairing_ui.html` is the single source of
+    # truth — no generated header to commit, no build step to run by hand.
+    # mtime=0 keeps the gzip header (and thus the build) reproducible.
+    html_bytes = gzip.compress(PAIRING_UI_HTML.read_bytes(), mtime=0)
     html_arr = cg.progmem_array(
         config[CONF_PAIRING_UI_HTML_ID], [HexInt(b) for b in html_bytes]
     )

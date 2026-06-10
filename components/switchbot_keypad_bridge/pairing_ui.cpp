@@ -81,6 +81,9 @@ esp_err_t PairingUi::handle_root_(httpd_req_t *req) {
   }
   httpd_resp_set_type(req, "text/html; charset=utf-8");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  // The page is stored gzip-compressed in flash (see __init__.py). Served
+  // as-is without checking Accept-Encoding: every browser accepts gzip.
+  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
   return httpd_resp_send(req, reinterpret_cast<const char *>(self->html_),
                          static_cast<ssize_t>(self->html_len_));
 }
