@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-#include "cloud_client.h"
+#include "keypad_advert.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -57,6 +57,10 @@ class KeypadPairer {
     std::string message;       // human-readable status of the current step
     std::string error;         // populated when state == FAILED
     std::string job_id;        // matches the value returned by start()
+    // Identity of the keypad just paired, valid only when state == SUCCESS.
+    // The family comes from the live advertisement read during discovery.
+    std::string keypad_mac;    // pretty form, e.g. "B0:E9:FE:..."
+    KeypadFamily family{KeypadFamily::ORIGINAL};
   };
 
   // Arguments for a single pairing attempt. The protocol family is NOT passed
@@ -84,7 +88,7 @@ class KeypadPairer {
   // Step helpers (push step number + message, log, return immediately).
   void set_step_(uint8_t step, const char *msg);
   void set_running_(uint8_t total, const std::string &job_id);
-  void set_success_();
+  void set_success_(const std::string &keypad_mac, KeypadFamily family);
   void set_failed_(const std::string &err);
 
   // BLE notification sink: we look for the 20-byte session-IV response

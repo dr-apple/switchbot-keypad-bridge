@@ -49,8 +49,11 @@ class PairingUi {
     this->html_len_ = len;
   }
 
-  // Called once after a successful pairing with the keypad's display name.
-  void set_on_paired_callback(std::function<void(const std::string &)> cb) {
+  // Called once after a successful pairing with the keypad's display name,
+  // pretty MAC and protocol family (the latter two feed the battery scan).
+  using OnPairedCallback = std::function<void(
+      const std::string &name, const std::string &mac, KeypadFamily family)>;
+  void set_on_paired_callback(OnPairedCallback cb) {
     this->on_paired_cb_ = std::move(cb);
   }
 
@@ -78,7 +81,7 @@ class PairingUi {
   std::array<uint8_t, 16> shared_key_{};
   const uint8_t *html_{nullptr};
   size_t         html_len_{0};
-  std::function<void(const std::string &)> on_paired_cb_;
+  OnPairedCallback on_paired_cb_;
   // Identify the pairing this UI started. The success handler matches
   // Status::job_id against pairing_job_id_ before firing on_paired_cb_,
   // so a previous job's lingering SUCCESS can never apply the wrong

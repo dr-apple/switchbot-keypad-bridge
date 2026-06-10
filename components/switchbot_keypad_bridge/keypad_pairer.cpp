@@ -1,12 +1,13 @@
 #include "keypad_pairer.h"
 
 #include <host/ble_gap.h>
-#include <psa/crypto.h>
 
 #include <cstdio>
 #include <cstring>
 
 #include "esphome/core/log.h"
+#include "aes_ctr.h"
+#include "ble_utils.h"
 #include "keypad_advert.h"
 
 namespace esphome {
@@ -64,8 +65,8 @@ constexpr FamilyPreset VISION_PRESET = {
     VISION_ENABLE_DOORBELL,    sizeof(VISION_ENABLE_DOORBELL),
 };
 
-const FamilyPreset &preset_for(CloudClient::KeypadFamily f) {
-  return f == CloudClient::KeypadFamily::VISION ? VISION_PRESET : ORIGINAL_PRESET;
+const FamilyPreset &preset_for(KeypadFamily f) {
+  return f == KeypadFamily::VISION ? VISION_PRESET : ORIGINAL_PRESET;
 }
 
 // Friendly step labels — kept short so the UI's progress card stays tidy.
@@ -83,46 +84,6 @@ constexpr const char *STEP_LABELS[] = {
 };
 constexpr uint8_t TOTAL_STEPS = sizeof(STEP_LABELS) / sizeof(STEP_LABELS[0]);
 
-// AES-128-CTR via PSA Crypto. The keypad K14 only lives for the
-// duration of one pairing run, so we import the key fresh each time
-// and destroy it at the end of the call.  Same primitive the runtime
-// decrypt path uses — no extra IDF component dependency.
-bool aes_ctr_xcrypt(const uint8_t *key, const uint8_t iv[16],
-                    const uint8_t *in, uint8_t *out, size_t length) {
-  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
-  psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
-  psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
-  psa_set_key_bits(&attrs, 128);
-
-  psa_key_id_t key_id = PSA_KEY_ID_NULL;
-  psa_status_t s = psa_import_key(&attrs, key, 16, &key_id);
-  psa_reset_key_attributes(&attrs);
-  if (s != PSA_SUCCESS) return false;
-
-  psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
-  size_t out_len = 0, finish_len = 0;
-  s = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CTR);
-  if (s == PSA_SUCCESS) s = psa_cipher_set_iv(&op, iv, 16);
-  if (s == PSA_SUCCESS) s = psa_cipher_update(&op, in, length, out, length, &out_len);
-  if (s == PSA_SUCCESS) s = psa_cipher_finish(&op, out + out_len, length - out_len, &finish_len);
-  if (s != PSA_SUCCESS) psa_cipher_abort(&op);
-
-  psa_destroy_key(key_id);
-  return s == PSA_SUCCESS;
-}
-
-// Read the SwitchBot service-data blob from an advertisement (UUID 0xFD3D,
-// with the legacy 0x0D00 as a fallback). Empty when the device isn't
-// advertising SwitchBot service data.
-std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
-  static const NimBLEUUID U_FD3D(static_cast<uint16_t>(0xFD3D));
-  static const NimBLEUUID U_0D00(static_cast<uint16_t>(0x0D00));
-  std::string sd = adv->getServiceData(U_FD3D);
-  if (sd.empty()) sd = adv->getServiceData(U_0D00);
-  return std::vector<uint8_t>(sd.begin(), sd.end());
-}
-
 // Briefly scan and look up the advertising packet of the target MAC so
 // we can connect with the right address type. The keypad's first byte
 // (top 2 bits = 11) makes it a BLE "random static" address; without a
@@ -134,24 +95,14 @@ std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
 NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms,
                              KeypadIdent &ident_out) {
   NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->clearResults();
-  scan->setActiveScan(true);
-  scan->setInterval(45);
-  scan->setWindow(30);
+  configure_switchbot_scan(scan);
 
-  std::string target = mac_pretty;
-  for (auto &c : target) {
-    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-  }
+  const std::string target = upper_mac(mac_pretty);
 
   NimBLEScanResults results = scan->getResults(timeout_ms, false);
   for (int i = 0; i < results.getCount(); ++i) {
     const NimBLEAdvertisedDevice *adv = results.getDevice(i);
-    std::string found = adv->getAddress().toString();
-    for (auto &c : found) {
-      if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    }
-    if (found == target) {
+    if (upper_mac(adv->getAddress().toString()) == target) {
       const std::vector<uint8_t> sd = switchbot_service_data(adv);
       ident_out = identify_keypad(sd.data(), sd.size());
       ESP_LOGI(TAG, "Found keypad %s (addr_type=%d, advert=%s)",
@@ -256,13 +207,16 @@ void KeypadPairer::set_step_(uint8_t step, const char *msg) {
   this->status_.message = msg;
 }
 
-void KeypadPairer::set_success_() {
+void KeypadPairer::set_success_(const std::string &keypad_mac,
+                                KeypadFamily family) {
   ESP_LOGI(TAG, "Pairing successful");
   std::lock_guard<std::mutex> lk(this->mu_);
-  this->status_.state   = State::SUCCESS;
-  this->status_.step    = this->status_.total;
-  this->status_.message = "Pairing complete";
+  this->status_.state      = State::SUCCESS;
+  this->status_.step       = this->status_.total;
+  this->status_.message    = "Pairing complete";
   this->status_.error.clear();
+  this->status_.keypad_mac = keypad_mac;
+  this->status_.family     = family;
 }
 
 void KeypadPairer::set_failed_(const std::string &err) {
@@ -297,13 +251,15 @@ bool KeypadPairer::send_command_(NimBLERemoteCharacteristic *rx,
                                  const uint8_t *plaintext, size_t plaintext_len) {
   // Encrypted frame layout (same as the existing keypad command path):
   //   [0x57][key_id][IV[0]][IV[1]][AES-CTR(K14, IV, plaintext)]
+  // The keypad's K14 only lives for the duration of one pairing run, so it
+  // is imported fresh for each frame and destroyed right after.
   std::vector<uint8_t> frame(4 + plaintext_len);
   frame[0] = 0x57;
   frame[1] = this->key_id_;
   frame[2] = this->iv_[0];
   frame[3] = this->iv_[1];
-  if (!aes_ctr_xcrypt(this->key_.data(), this->iv_.data(),
-                      plaintext, frame.data() + 4, plaintext_len)) {
+  if (!aes_ctr_xcrypt_raw_key(this->key_.data(), this->iv_.data(),
+                              plaintext, frame.data() + 4, plaintext_len)) {
     return false;
   }
 
@@ -343,7 +299,7 @@ void KeypadPairer::execute_(Request &req) {
     return;
   }
   ESP_LOGI(TAG, "Pairing %s as %s family", ident.display_name,
-           ident.family == CloudClient::KeypadFamily::VISION ? "VISION" : "ORIGINAL");
+           ident.family == KeypadFamily::VISION ? "VISION" : "ORIGINAL");
   const FamilyPreset &preset = preset_for(ident.family);
 
   // The keypad might currently be connected to our peripheral (server) role —
@@ -487,7 +443,7 @@ void KeypadPairer::execute_(Request &req) {
   client->disconnect();
   NimBLEDevice::deleteClient(client);
 
-  this->set_success_();
+  this->set_success_(req.keypad_mac, ident.family);
 }
 
 }  // namespace switchbot_keypad_bridge

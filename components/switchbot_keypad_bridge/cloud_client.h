@@ -28,19 +28,12 @@ namespace switchbot_keypad_bridge {
 
 class CloudClient {
  public:
-  // Pairing-protocol dialect. The SwitchBot Keypad firmware ships in two
-  // families with slightly different BLE handshakes ("original" and "vision").
-  // Which family a keypad speaks is identified from its BLE advertisement
-  // (see keypad_advert.h), not from any cloud field.
-  enum class KeypadFamily { ORIGINAL, VISION };
-
   // Plain-data view of one account device as returned by
-  // /wonder/device/v3/getdevice. `list_keypads` returns every account device
-  // that carries a MAC. Whether a device is a keypad — and which family it
-  // speaks — is decided by the pairing UI / pairer from its live BLE
-  // advertisement (keypad_advert.h); the cloud only supplies identity (MAC,
-  // name) and, later, the communication key.
-  struct AccountKeypad {
+  // /wonder/device/v3/getdevice. Whether a device is a keypad — and which
+  // family it speaks — is decided by the pairing UI / pairer from its live
+  // BLE advertisement (keypad_advert.h); the cloud only supplies identity
+  // (MAC, name) and, later, the communication key.
+  struct AccountDevice {
     std::string mac;          // hex, no separators: "B0E9FE612E75"
     std::string mac_pretty;   // "B0:E9:FE:61:2E:75"
     std::string name;         // user-set, e.g. "Keypad Vision 75"
@@ -56,7 +49,7 @@ class CloudClient {
   // candidates). The caller decides which are really keypads by checking each
   // one's live BLE advertisement (keypad_advert.h). Successive calls are
   // cached — pass `force_refresh = true` to bypass.
-  bool list_keypads(std::vector<AccountKeypad> &out_keypads,
+  bool list_devices(std::vector<AccountDevice> &out_devices,
                     std::string &error_out, bool force_refresh = false);
 
   // Look up a specific keypad's communication key. `mac` may be in
@@ -72,7 +65,7 @@ class CloudClient {
   void clear() {
     this->auth_token_.clear();
     this->region_.clear();
-    this->keypads_cache_.clear();
+    this->devices_cache_.clear();
   }
 
  private:
@@ -88,7 +81,7 @@ class CloudClient {
 
   std::string auth_token_;
   std::string region_;
-  std::vector<AccountKeypad> keypads_cache_;
+  std::vector<AccountDevice> devices_cache_;
 };
 
 }  // namespace switchbot_keypad_bridge

@@ -64,23 +64,21 @@ std::string compact_mac(const std::string &any) {
   return out;
 }
 
-// Build a JSON object string for the simple `{"k": "v", ...}` requests
-// we need.  Just enough to avoid pulling in a full JSON library on the
-// write side — we already use cJSON to read.
+// Build the account-login request body. cJSON handles escaping, so a
+// password containing `"` or `\` is sent correctly rather than producing
+// malformed JSON.
 std::string build_login_body(const std::string &email,
                              const std::string &password) {
-  // No JSON escaping for email/password — SwitchBot account emails and
-  // passwords realistically never contain `"` or `\`. If they do, login
-  // fails cleanly with an API error.
-  std::string body;
-  body.reserve(160 + email.size() + password.size());
-  body += R"json({"clientId":")json";
-  body += CLIENT_ID;
-  body += R"json(","username":")json";
-  body += email;
-  body += R"json(","password":")json";
-  body += password;
-  body += R"json(","grantType":"password","verifyCode":""})json";
+  cJSON *o = cJSON_CreateObject();
+  cJSON_AddStringToObject(o, "clientId", CLIENT_ID);
+  cJSON_AddStringToObject(o, "username", email.c_str());
+  cJSON_AddStringToObject(o, "password", password.c_str());
+  cJSON_AddStringToObject(o, "grantType", "password");
+  cJSON_AddStringToObject(o, "verifyCode", "");
+  char *s = cJSON_PrintUnformatted(o);
+  std::string body = (s != nullptr) ? s : "{}";
+  if (s != nullptr) cJSON_free(s);
+  cJSON_Delete(o);
   return body;
 }
 
@@ -95,21 +93,48 @@ esp_err_t http_event_handler(esp_http_client_event_t *evt) {
   return ESP_OK;
 }
 
-// cJSON convenience: parse and extract the body's `statusCode` (which
-// SwitchBot APIs always set to 100 on success). Returns the parsed
-// cJSON root on success; the caller must `cJSON_Delete` it.
-cJSON *parse_envelope(const std::string &body, int &status_code,
-                      std::string &message) {
-  cJSON *root = cJSON_ParseWithLength(body.data(), body.size());
-  if (root == nullptr) {
-    return nullptr;
+// Parsed SwitchBot API envelope. Every endpoint wraps its payload the same
+// way: `{"statusCode": 100, "message": "...", "body": {...}}`. The cJSON
+// tree is freed on scope exit, so error paths can simply return.
+class Envelope {
+ public:
+  explicit Envelope(const std::string &raw) {
+    this->root_ = cJSON_ParseWithLength(raw.data(), raw.size());
+    if (this->root_ == nullptr) return;
+    cJSON *sc = cJSON_GetObjectItemCaseSensitive(this->root_, "statusCode");
+    this->status_code_ = cJSON_IsNumber(sc) ? sc->valueint : -1;
+    cJSON *msg = cJSON_GetObjectItemCaseSensitive(this->root_, "message");
+    if (cJSON_IsString(msg) && msg->valuestring != nullptr) {
+      this->message_ = msg->valuestring;
+    }
   }
-  cJSON *sc = cJSON_GetObjectItemCaseSensitive(root, "statusCode");
-  status_code = cJSON_IsNumber(sc) ? sc->valueint : -1;
-  cJSON *msg = cJSON_GetObjectItemCaseSensitive(root, "message");
-  message = (cJSON_IsString(msg) && msg->valuestring) ? msg->valuestring : "";
-  return root;
-}
+  ~Envelope() {
+    if (this->root_ != nullptr) cJSON_Delete(this->root_);
+  }
+  Envelope(const Envelope &) = delete;
+  Envelope &operator=(const Envelope &) = delete;
+
+  bool is_json() const { return this->root_ != nullptr; }
+  // SwitchBot APIs set statusCode 100 on success.
+  bool ok() const { return this->is_json() && this->status_code_ == 100; }
+  // The API's own error message, or `fallback` when it didn't send one.
+  std::string error_or(const char *fallback) const {
+    return this->message_.empty() ? fallback : this->message_;
+  }
+  cJSON *body() const {
+    return this->is_json() ? cJSON_GetObjectItemCaseSensitive(this->root_, "body") : nullptr;
+  }
+  // Convenience: `body()[key]`, or nullptr anywhere along the way.
+  cJSON *body_item(const char *key) const {
+    cJSON *b = this->body();
+    return b != nullptr ? cJSON_GetObjectItemCaseSensitive(b, key) : nullptr;
+  }
+
+ private:
+  cJSON *root_{nullptr};
+  int status_code_{-1};
+  std::string message_;
+};
 
 bool parse_hex_byte(const char *s, uint8_t &out) {
   auto digit = [](char c) -> int {
@@ -229,27 +254,21 @@ bool CloudClient::login(const std::string &email, const std::string &password,
       return false;
     }
 
-    int sc = -1;
-    std::string msg;
-    cJSON *root = parse_envelope(response, sc, msg);
-    if (root == nullptr) {
+    Envelope env(response);
+    if (!env.is_json()) {
       error_out = "Login response was not valid JSON";
       return false;
     }
-    if (sc != 100) {
-      error_out = msg.empty() ? "Login rejected" : msg;
-      cJSON_Delete(root);
+    if (!env.ok()) {
+      error_out = env.error_or("Login rejected");
       return false;
     }
-    cJSON *body_obj = cJSON_GetObjectItemCaseSensitive(root, "body");
-    cJSON *tok = body_obj ? cJSON_GetObjectItemCaseSensitive(body_obj, "access_token") : nullptr;
+    cJSON *tok = env.body_item("access_token");
     if (!cJSON_IsString(tok) || tok->valuestring == nullptr) {
       error_out = "Login succeeded but no access_token returned";
-      cJSON_Delete(root);
       return false;
     }
     this->auth_token_ = tok->valuestring;
-    cJSON_Delete(root);
   }
 
   // Step 2: userinfo -> region. Failure here is non-fatal: we default
@@ -260,17 +279,11 @@ bool CloudClient::login(const std::string &email, const std::string &password,
     std::string response;
     std::string ignored_err;
     if (this->post_json_(url, "{}", this->auth_token_, response, ignored_err)) {
-      int sc = -1;
-      std::string msg;
-      cJSON *root = parse_envelope(response, sc, msg);
-      if (root != nullptr && sc == 100) {
-        cJSON *body_obj = cJSON_GetObjectItemCaseSensitive(root, "body");
-        cJSON *r = body_obj ? cJSON_GetObjectItemCaseSensitive(body_obj, "botRegion") : nullptr;
-        if (cJSON_IsString(r) && r->valuestring && r->valuestring[0] != '\0') {
-          this->region_ = r->valuestring;
-        }
+      Envelope env(response);
+      cJSON *r = env.ok() ? env.body_item("botRegion") : nullptr;
+      if (cJSON_IsString(r) && r->valuestring && r->valuestring[0] != '\0') {
+        this->region_ = r->valuestring;
       }
-      if (root != nullptr) cJSON_Delete(root);
     }
   }
 
@@ -278,14 +291,14 @@ bool CloudClient::login(const std::string &email, const std::string &password,
   return true;
 }
 
-bool CloudClient::list_keypads(std::vector<AccountKeypad> &out_keypads,
+bool CloudClient::list_devices(std::vector<AccountDevice> &out_devices,
                                std::string &error_out, bool force_refresh) {
   if (!this->is_logged_in()) {
     error_out = "Not logged in";
     return false;
   }
-  if (!force_refresh && !this->keypads_cache_.empty()) {
-    out_keypads = this->keypads_cache_;
+  if (!force_refresh && !this->devices_cache_.empty()) {
+    out_devices = this->devices_cache_;
     return true;
   }
 
@@ -296,50 +309,44 @@ bool CloudClient::list_keypads(std::vector<AccountKeypad> &out_keypads,
     return false;
   }
 
-  int sc = -1;
-  std::string msg;
-  cJSON *root = parse_envelope(response, sc, msg);
-  if (root == nullptr) {
+  Envelope env(response);
+  if (!env.is_json()) {
     error_out = "Device list response was not valid JSON";
     return false;
   }
-  if (sc != 100) {
-    error_out = msg.empty() ? "Device list rejected" : msg;
-    cJSON_Delete(root);
+  if (!env.ok()) {
+    error_out = env.error_or("Device list rejected");
     return false;
   }
 
-  cJSON *body_obj = cJSON_GetObjectItemCaseSensitive(root, "body");
-  cJSON *items = body_obj ? cJSON_GetObjectItemCaseSensitive(body_obj, "Items") : nullptr;
+  cJSON *items = env.body_item("Items");
   if (!cJSON_IsArray(items)) {
     error_out = "Device list missing Items array";
-    cJSON_Delete(root);
     return false;
   }
 
   // Return every account device that has a MAC. We don't classify here — the
   // pairing UI decides which of these are keypads purely from each device's
   // live BLE advertisement (see keypad_advert.h).
-  std::vector<AccountKeypad> picked;
+  std::vector<AccountDevice> picked;
   cJSON *item = nullptr;
   cJSON_ArrayForEach(item, items) {
     cJSON *mac = cJSON_GetObjectItemCaseSensitive(item, "device_mac");
     if (!cJSON_IsString(mac) || mac->valuestring == nullptr) continue;
     cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "device_name");
 
-    AccountKeypad kp;
-    kp.mac          = compact_mac(mac->valuestring);
-    kp.mac_pretty   = pretty_mac(kp.mac);
-    kp.name         = (cJSON_IsString(name) && name->valuestring) ? name->valuestring
-                                                                   : kp.mac_pretty;
-    picked.push_back(std::move(kp));
+    AccountDevice dev;
+    dev.mac          = compact_mac(mac->valuestring);
+    dev.mac_pretty   = pretty_mac(dev.mac);
+    dev.name         = (cJSON_IsString(name) && name->valuestring) ? name->valuestring
+                                                                    : dev.mac_pretty;
+    picked.push_back(std::move(dev));
   }
-  cJSON_Delete(root);
 
   ESP_LOGI(TAG, "Account has %u device(s)", static_cast<unsigned>(picked.size()));
 
-  this->keypads_cache_ = picked;
-  out_keypads = std::move(picked);
+  this->devices_cache_ = picked;
+  out_devices = std::move(picked);
   return true;
 }
 
@@ -364,24 +371,19 @@ bool CloudClient::fetch_keypad_key(const std::string &mac,
     return false;
   }
 
-  int sc = -1;
-  std::string msg;
-  cJSON *root = parse_envelope(response, sc, msg);
-  if (root == nullptr) {
+  Envelope env(response);
+  if (!env.is_json()) {
     error_out = "communicate response was not valid JSON";
     return false;
   }
-  if (sc != 100) {
-    error_out = msg.empty() ? "communicate rejected" : msg;
-    cJSON_Delete(root);
+  if (!env.ok()) {
+    error_out = env.error_or("communicate rejected");
     return false;
   }
 
-  cJSON *body_obj = cJSON_GetObjectItemCaseSensitive(root, "body");
-  cJSON *ckey = body_obj ? cJSON_GetObjectItemCaseSensitive(body_obj, "communicationKey") : nullptr;
+  cJSON *ckey = env.body_item("communicationKey");
   if (!cJSON_IsObject(ckey)) {
     error_out = "communicate response missing communicationKey";
-    cJSON_Delete(root);
     return false;
   }
   cJSON *kid = cJSON_GetObjectItemCaseSensitive(ckey, "keyId");
@@ -389,17 +391,14 @@ bool CloudClient::fetch_keypad_key(const std::string &mac,
   if (!cJSON_IsString(kid) || !cJSON_IsString(k) ||
       kid->valuestring == nullptr || k->valuestring == nullptr) {
     error_out = "communicate response missing keyId/key";
-    cJSON_Delete(root);
     return false;
   }
 
   key_id_hex = kid->valuestring;
   if (!parse_hex_string(k->valuestring, key_bytes) || key_bytes.size() != 16) {
     error_out = "communicate returned a malformed AES key";
-    cJSON_Delete(root);
     return false;
   }
-  cJSON_Delete(root);
   return true;
 }
 
