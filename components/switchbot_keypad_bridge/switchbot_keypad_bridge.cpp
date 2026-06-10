@@ -243,15 +243,12 @@ void SwitchbotKeypadBridge::loop() {
     });
   }
 
-  // Drain the RX queue. Doing a copy and clear limits memory allocation
-  // in the NimBLE thread side to the bare minimum, avoiding heap thrashing.
+  // Drain the RX queue. Swapping the vector out keeps the critical section
+  // free of allocation and copying, so the NimBLE task never waits on it.
   std::vector<QueuedEvent> pending;
   {
     std::lock_guard<std::mutex> lk(this->rx_mutex_);
-    if (!this->rx_queue_.empty()) {
-      pending = this->rx_queue_;
-      this->rx_queue_.clear();
-    }
+    pending.swap(this->rx_queue_);
   }
 
   for (const auto &ev : pending) {
@@ -282,6 +279,16 @@ void SwitchbotKeypadBridge::unpair() {
   if (!this->import_aes_key_()) {
     ESP_LOGE(TAG, "Key rotation failed — unpair aborted");
     return;
+  }
+
+  // Stop an in-flight battery scan window: the wizard's own blocking scans
+  // share the NimBLE scan singleton and must not race it.
+  if (this->battery_scan_active_.exchange(false)) {
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan->isScanning()) {
+      scan->stop();
+    }
+    scan->clearResults();
   }
 
   // Forget the paired keypad name and its battery-scan identity.
@@ -493,6 +500,11 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
     return;
   }
 
+  // DOORBELL is deliberately left out of the replay filter: under a fixed
+  // session IV a second legitimate press in the same connection produces the
+  // exact same ciphertext, and dropping it would swallow real rings. Worst
+  // case for a replayed doorbell frame is a spurious chime; a replayed
+  // lock/unlock changes security state, so only those are filtered.
   if (command.type == CommandType::LOCK || command.type == CommandType::UNLOCK) {
     if (ciphertext_seen) {
       ESP_LOGW(TAG, "Dropping action: ciphertext replay within session");
