@@ -20,9 +20,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 
 #include "cloud_client.h"
+#include "keypad_advert.h"
 #include "keypad_pairer.h"
 
 namespace esphome {
@@ -90,6 +92,13 @@ class PairingUi {
   std::string    pairing_keypad_name_;
   std::string    pairing_job_id_;
   bool           success_notified_{false};
+
+  // Keypads identified from their BLE advertisement, keyed by pretty MAC. A
+  // keypad's model signature rides in the 0xFD3D service data, which for the
+  // Keypad Vision only arrives in the (intermittently received) scan response.
+  // Caching every positive identification keeps such a keypad listed on later
+  // scans where its service data was missed, as long as it's still in range.
+  std::map<std::string, KeypadIdent> identified_keypads_;
 };
 
 }  // namespace switchbot_keypad_bridge

@@ -74,6 +74,10 @@ const FamilyPreset &preset_for(KeypadFamily f) {
 // The wizard fetches these through step_count()/step_label() (via the
 // /api/pair response) and builds its stepper from them, so this list is
 // the single source of truth for count, order and wording.
+//
+// The first BASE_STEP_COUNT entries are common to every family; the trailing
+// "Enabling doorbell" step exists only on the Vision family (Original/Touch
+// keypads have no doorbell).
 constexpr const char *STEP_LABELS[] = {
     "Connecting to keypad",
     "Discovering services",
@@ -83,8 +87,11 @@ constexpr const char *STEP_LABELS[] = {
     "Writing shared key (2/2)",
     "Updating lock target",
     "Finalising",
+    "Force-enabling doorbell",  // Vision-only
 };
-constexpr uint8_t TOTAL_STEPS = sizeof(STEP_LABELS) / sizeof(STEP_LABELS[0]);
+constexpr uint8_t BASE_STEP_COUNT   = 8;   // steps 0..7, every family
+constexpr uint8_t DOORBELL_STEP      = 8;   // index of the Vision-only step
+constexpr uint8_t VISION_STEP_COUNT = 9;   // base + doorbell
 
 // Briefly scan and look up the advertising packet of the target MAC so
 // we can connect with the right address type. The keypad's first byte
@@ -109,7 +116,7 @@ NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms
       ident_out = identify_keypad(sd.data(), sd.size());
       ESP_LOGI(TAG, "Found keypad %s (addr_type=%d, advert=%s)",
                mac_pretty.c_str(), adv->getAddressType(),
-               ident_out.is_keypad ? ident_out.display_name : "unrecognised");
+               ident_out.is_keypad ? keypad_family_str(ident_out.family) : "unrecognised");
       return adv->getAddress();
     }
   }
@@ -120,10 +127,12 @@ NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-uint8_t KeypadPairer::step_count() { return TOTAL_STEPS; }
+uint8_t KeypadPairer::step_count(KeypadFamily family) {
+  return family == KeypadFamily::VISION ? VISION_STEP_COUNT : BASE_STEP_COUNT;
+}
 
-const char *KeypadPairer::step_label(uint8_t step) {
-  return step < TOTAL_STEPS ? STEP_LABELS[step] : "";
+const char *KeypadPairer::step_label(KeypadFamily family, uint8_t step) {
+  return step < step_count(family) ? STEP_LABELS[step] : "";
 }
 
 std::string KeypadPairer::start(Request req) {
@@ -156,7 +165,7 @@ std::string KeypadPairer::start(Request req) {
   }
   while (xSemaphoreTake(this->ack_sem_, 0) == pdTRUE) { /* drain */ }
 
-  this->set_running_(TOTAL_STEPS, job_id);
+  this->set_running_(step_count(req_heap->family), job_id);
 
   // Spawn the task. The trampoline forwards to execute_() and frees the
   // request when done.
@@ -208,9 +217,9 @@ void KeypadPairer::set_running_(uint8_t total, const std::string &job_id) {
 }
 
 void KeypadPairer::set_step_(uint8_t step, const char *msg) {
-  ESP_LOGI(TAG, "Step %u/%u: %s", static_cast<unsigned>(step + 1),
-           static_cast<unsigned>(TOTAL_STEPS), msg);
   std::lock_guard<std::mutex> lk(this->mu_);
+  ESP_LOGI(TAG, "Step %u/%u: %s", static_cast<unsigned>(step + 1),
+           static_cast<unsigned>(this->status_.total), msg);
   this->status_.step    = step;
   this->status_.message = msg;
 }
@@ -299,16 +308,14 @@ void KeypadPairer::execute_(Request &req) {
     return;
   }
 
-  // The keypad model — and therefore the pairing dialect — comes solely from
-  // the live advertisement. If we can't identify it, we don't guess.
-  if (!ident.is_keypad) {
-    this->set_failed_("Could not identify the keypad from its advertisement. "
-                      "Reset it into pairing mode, keep it within 2 m and retry.");
-    return;
-  }
-  ESP_LOGI(TAG, "Pairing %s as %s family", ident.display_name,
-           ident.family == KeypadFamily::VISION ? "VISION" : "ORIGINAL");
-  const FamilyPreset &preset = preset_for(ident.family);
+  // The pairing dialect follows the family already identified by the UI (from
+  // the BLE service-data signature, cached by MAC). We do NOT re-derive it from
+  // this scan: the Keypad Vision doesn't carry its signature on every
+  // advertisement, so discover_target may legitimately fail to classify it even
+  // though it is a keypad. The scan above was only needed for the address type.
+  const KeypadFamily family = req.family;
+  ESP_LOGI(TAG, "Pairing keypad as %s family", keypad_family_str(family));
+  const FamilyPreset &preset = preset_for(family);
 
   // The keypad might currently be connected to our peripheral (server) role —
   // it sends IV requests to us as a SwitchBot Lock emulation. The BLE spec
@@ -450,10 +457,14 @@ void KeypadPairer::execute_(Request &req) {
   uint8_t finalize2[] = {0x0f, 0x53, 0x01, 0x06};
   this->send_command_(rx, finalize2, sizeof(finalize2));
 
-  // Enable the doorbell by default while we hold an authenticated session
-  // (Vision only). Best-effort: an unsupported keypad just ACKs and ignores it.
+  // Step 8 (Vision only): enable the doorbell while we still hold an
+  // authenticated session. The slot is written and finalised, so this is the
+  // last safe moment to push a setting before disconnecting. Surfaced as its
+  // own step — the user sees it happen instead of it being a silent extra.
+  // Still best-effort: the keypad is already paired and usable, so a missing
+  // ACK here must not fail the whole job.
   if (preset.enable_doorbell != nullptr) {
-    ESP_LOGI(TAG, "Enabling doorbell button");
+    this->set_step_(DOORBELL_STEP, STEP_LABELS[DOORBELL_STEP]);
     this->send_command_(rx, preset.enable_doorbell, preset.enable_doorbell_len);
   }
 
@@ -461,7 +472,7 @@ void KeypadPairer::execute_(Request &req) {
   client->disconnect();
   NimBLEDevice::deleteClient(client);
 
-  this->set_success_(req.keypad_mac, ident.family);
+  this->set_success_(req.keypad_mac, family);
 }
 
 }  // namespace switchbot_keypad_bridge

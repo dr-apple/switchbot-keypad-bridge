@@ -121,9 +121,10 @@ std::string extract_json_str(const std::string &body, const char *key) {
 }
 
 // One nearby BLE device: strongest RSSI seen plus its SwitchBot service-data
-// blob (so the UI can identify the keypad model the pySwitchbot way).
+// blob (so the UI can identify the keypad model the pySwitchbot way). rssi
+// starts below any real BLE reading so the first packet always wins.
 struct NearbyDevice {
-  int rssi{0};
+  int rssi{-128};
   std::vector<uint8_t> svc_data;
 };
 
@@ -141,13 +142,17 @@ std::map<std::string, NearbyDevice> scan_nearby(uint32_t duration_ms) {
     const NimBLEAdvertisedDevice *adv = results.getDevice(i);
     const std::string mac = upper_mac(adv->getAddress().toString());
     const int rssi = adv->getRSSI();
-    auto it = seen.find(mac);
-    if (it == seen.end() || rssi > it->second.rssi) {
-      NearbyDevice &dev = seen[mac];
-      dev.rssi = rssi;
-      std::vector<uint8_t> sd = switchbot_service_data(adv);
-      if (!sd.empty()) dev.svc_data = std::move(sd);
-    }
+    NearbyDevice &dev = seen[mac];  // inserts a default entry on first sight
+    if (rssi > dev.rssi) dev.rssi = rssi;
+    // The 0xFD3D service data rides in the scan response, which usually arrives
+    // as a separate packet at a different RSSI than the plain advertisement.
+    // Capture it whenever a packet carries it — independent of RSSI. Gating this
+    // on "strongest RSSI seen" (as before) dropped a keypad's service data
+    // whenever its adv packet was stronger than its scan response, leaving the
+    // device looking like a non-keypad. With two keypads in range that flakily
+    // hid one or the other depending on packet order.
+    std::vector<uint8_t> sd = switchbot_service_data(adv);
+    if (!sd.empty()) dev.svc_data = std::move(sd);
   }
   scan->clearResults();
   return seen;
@@ -190,25 +195,44 @@ esp_err_t PairingUi::handle_keypads_(httpd_req_t *req) {
   // Cross-reference the account devices against a fresh BLE scan: this both
   // shows which ones are in range (and how strong the signal is) and identifies
   // the keypad model straight from the advertisement (pySwitchbot-style).
-  const std::map<std::string, NearbyDevice> nearby = scan_nearby(4000);
+  // 8 s: keypads are battery devices that advertise infrequently when idle, and
+  // the radio is time-shared with WiFi and the lock advertising — a short window
+  // often catches only one of several keypads. A longer scan reliably finds all.
+  const std::map<std::string, NearbyDevice> nearby = scan_nearby(8000);
 
   cJSON *arr = cJSON_CreateArray();
   unsigned shown = 0;
   for (const auto &k : devices) {
     const auto hit = nearby.find(k.mac_pretty);
-    if (hit == nearby.end() || hit->second.svc_data.empty()) continue;
+    if (hit == nearby.end()) continue;  // not in BLE range right now
 
-    // A device is a keypad only if its live advertisement matches a known
-    // SwitchBot keypad signature. Everything else (locks, bots, hubs, …) and
-    // any out-of-range device is skipped — detection is BLE-only.
-    const KeypadIdent ident = identify_keypad(hit->second.svc_data.data(),
-                                              hit->second.svc_data.size());
+    // Identify from the live advertisement. A keypad's signature rides in the
+    // 0xFD3D service data, which for the Keypad Vision only arrives in the
+    // (intermittently received) scan response. So cache every positive
+    // identification by MAC and fall back to it on later scans where the
+    // service data was missed — as long as the device is still in range. This
+    // is what keeps the Vision from flickering in and out of the list.
+    KeypadIdent ident =
+        identify_keypad(hit->second.svc_data.data(), hit->second.svc_data.size());
+    if (ident.is_keypad) {
+      self->identified_keypads_[k.mac_pretty] = ident;
+    } else {
+      const auto cached = self->identified_keypads_.find(k.mac_pretty);
+      if (cached != self->identified_keypads_.end()) ident = cached->second;
+    }
     if (!ident.is_keypad) continue;
+
+    ESP_LOGI(TAG, "keypad '%s' %s family=%s rssi=%d", k.name.c_str(),
+             k.mac_pretty.c_str(), keypad_family_str(ident.family),
+             hit->second.rssi);
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "mac", k.mac_pretty.c_str());
     cJSON_AddStringToObject(o, "name", k.name.c_str());
-    cJSON_AddStringToObject(o, "model", ident.display_name);
+    // The pairing dialect (and which steps the wizard shows) follows from the
+    // family detected here. The browser echoes it back on /api/pair so the
+    // step list is correct before the pairer re-confirms it over BLE.
+    cJSON_AddStringToObject(o, "family", keypad_family_str(ident.family));
     cJSON_AddBoolToObject(o, "online", true);
     cJSON_AddNumberToObject(o, "rssi", hit->second.rssi);
     cJSON_AddItemToArray(arr, o);
@@ -227,15 +251,17 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   if (mac.empty()) {
     return reply_error_(req, "400 Bad Request", "Missing keypad mac.");
   }
-  ESP_LOGI(TAG, "POST /api/pair mac=%s", mac.c_str());
+  // Family as identified by /api/keypads and echoed back by the browser. It
+  // sizes the step list shown during pairing; the pairer re-confirms it from
+  // the live advertisement before acting.
+  const KeypadFamily family = keypad_family_from_str(extract_json_str(body, "family").c_str());
+  ESP_LOGI(TAG, "POST /api/pair mac=%s family=%s", mac.c_str(), keypad_family_str(family));
 
   if (!self->cloud_.is_logged_in()) {
     return reply_error_(req, "401 Unauthorized", "Sign in first.");
   }
 
   // Confirm the MAC belongs to this account (and grab its pretty form + name).
-  // The protocol family is determined later by the pairer from the keypad's
-  // live BLE advertisement.
   std::vector<CloudClient::AccountDevice> devices;
   std::string err;
   if (!self->cloud_.list_devices(devices, err)) {
@@ -265,6 +291,7 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   // Build the pairer's request.
   KeypadPairer::Request kr;
   kr.keypad_mac  = found->mac_pretty;
+  kr.family      = family;
   kr.key_id     = static_cast<int>(std::strtol(key_id_hex.c_str(), nullptr, 16));
   kr.key        = std::move(key_bytes);
   kr.shared_token = self->shared_key_;
@@ -288,9 +315,10 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   cJSON_AddStringToObject(resp, "job_id", job_id.c_str());
   // Step labels for the progress stepper — the wizard renders these, so the
   // pairer stays the single source of truth for count, order and wording.
+  // The Vision family has one extra step (enabling the doorbell).
   cJSON *labels = cJSON_AddArrayToObject(resp, "labels");
-  for (uint8_t i = 0; i < KeypadPairer::step_count(); ++i) {
-    cJSON_AddItemToArray(labels, cJSON_CreateString(KeypadPairer::step_label(i)));
+  for (uint8_t i = 0; i < KeypadPairer::step_count(family); ++i) {
+    cJSON_AddItemToArray(labels, cJSON_CreateString(KeypadPairer::step_label(family, i)));
   }
   return reply_json_(req, json_take(resp).c_str());
 }

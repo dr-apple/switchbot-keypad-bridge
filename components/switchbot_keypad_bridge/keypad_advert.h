@@ -25,10 +25,15 @@ namespace switchbot_keypad_bridge {
 // advertisement — never from any cloud field.
 enum class KeypadFamily : uint8_t { ORIGINAL, VISION };
 
+// Stable wire names for the family, used to carry it between the pairing UI
+// and the firmware. `keypad_family_from_str` falls back to ORIGINAL for any
+// unrecognised input.
+const char *keypad_family_str(KeypadFamily family);
+KeypadFamily keypad_family_from_str(const char *s);
+
 struct KeypadIdent {
   bool is_keypad{false};
   KeypadFamily family{KeypadFamily::ORIGINAL};
-  const char *display_name{"Keypad"};
 };
 
 // Identify a SwitchBot keypad from the bytes of its 0xFD3D service-data

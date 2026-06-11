@@ -55,11 +55,13 @@ class KeypadPairer {
     KeypadFamily family{KeypadFamily::ORIGINAL};
   };
 
-  // Arguments for a single pairing attempt. The protocol family is NOT passed
-  // in — the pairer reads it from the keypad's live BLE advertisement during
-  // discovery (keypad_advert.h), which is the single source of truth.
+  // Arguments for a single pairing attempt. `family` comes from the UI's
+  // advertisement-based identification (keypad_advert.h) and decides the step
+  // list shown; the pairer re-confirms it from the live advert during
+  // discovery and that live value drives the actual protocol dialect.
   struct Request {
     std::string                  keypad_mac;       // pretty form, e.g. "B0:E9:FE:..."
+    KeypadFamily                 family{KeypadFamily::ORIGINAL};
     int                          key_id{0};        // 0x88 / 0xC6 / ... from cloud
     std::vector<uint8_t>         key;              // 16-byte AES-CTR key from cloud
     std::array<uint8_t, 16>      shared_token{};   // the random key we inject
@@ -73,9 +75,10 @@ class KeypadPairer {
 
   // The user-facing label of each pairing step, in order. The wizard builds
   // its progress stepper from these (returned by /api/pair), so the pairer
-  // is the single source of truth for step count, order and wording.
-  static uint8_t step_count();
-  static const char *step_label(uint8_t step);
+  // is the single source of truth for step count, order and wording. The
+  // Vision family has one extra trailing step (enabling the doorbell).
+  static uint8_t step_count(KeypadFamily family);
+  static const char *step_label(KeypadFamily family, uint8_t step);
 
   // Atomic snapshot of progress. Suitable for polling from any thread.
   Status status() const;
