@@ -1,7 +1,18 @@
 #include "keypad_advert.h"
 
+#include <cstring>
+
 namespace esphome {
 namespace switchbot_keypad_bridge {
+
+const char *keypad_family_str(KeypadFamily family) {
+  return family == KeypadFamily::VISION ? "vision" : "original";
+}
+
+KeypadFamily keypad_family_from_str(const char *s) {
+  return (s != nullptr && std::strcmp(s, "vision") == 0) ? KeypadFamily::VISION
+                                                         : KeypadFamily::ORIGINAL;
+}
 
 namespace {
 
@@ -35,32 +46,41 @@ KeypadIdent identify_keypad(const uint8_t *svc_data, size_t len) {
   // 1. First-byte match (low 7 bits) — Keypad / Keypad Touch (Original family).
   if ((svc_data[0] & 0x7F) == KEYPAD_TYPE_BYTE) {
     id.is_keypad = true;
-    id.family = CloudClient::KeypadFamily::ORIGINAL;
-    id.display_name = "Keypad";
+    id.family = KeypadFamily::ORIGINAL;
     return id;
   }
 
-  // 2. Trailing 4-byte window — Vision / Vision Pro (Vision family). Try both
-  //    the last-4 and the next-to-last-4 windows, as pySwitchbot does.
+  // 2. Trailing 4-byte window — Keypad Vision (?? 11 03 78) and Keypad Vision
+  //    Pro (?? 11 51 98), both the Vision family. Try the last-4 and the
+  //    next-to-last-4 windows, as pySwitchbot does.
   if (len > 5) {
     const uint8_t *windows[] = {svc_data + (len - 4), svc_data + (len - 5)};
     for (const uint8_t *w : windows) {
-      if (suffix_is(w, 0x11, 0x03, 0x78)) {
+      if (suffix_is(w, 0x11, 0x03, 0x78) || suffix_is(w, 0x11, 0x51, 0x98)) {
         id.is_keypad = true;
-        id.family = CloudClient::KeypadFamily::VISION;
-        id.display_name = "Keypad Vision";
-        return id;
-      }
-      if (suffix_is(w, 0x11, 0x51, 0x98)) {
-        id.is_keypad = true;
-        id.family = CloudClient::KeypadFamily::VISION;
-        id.display_name = "Keypad Vision Pro";
+        id.family = KeypadFamily::VISION;
         return id;
       }
     }
   }
 
   return id;
+}
+
+int parse_keypad_battery(KeypadFamily family,
+                         const uint8_t *svc_data, size_t svc_len,
+                         const uint8_t *mfr_data, size_t mfr_len) {
+  if (family == KeypadFamily::ORIGINAL) {
+    if (svc_data == nullptr || svc_len < 3) return -1;
+    return svc_data[2] & 0x7F;
+  }
+
+  // VISION: pySwitchbot reads mfr_data[7], where mfr_data is the payload
+  // after the company id — the raw AD blob therefore carries it at byte 9,
+  // behind the little-endian SwitchBot company id (0x69 0x09).
+  if (mfr_data == nullptr || mfr_len < 10) return -1;
+  if (mfr_data[0] != 0x69 || mfr_data[1] != 0x09) return -1;
+  return mfr_data[9] & 0x7F;
 }
 
 }  // namespace switchbot_keypad_bridge

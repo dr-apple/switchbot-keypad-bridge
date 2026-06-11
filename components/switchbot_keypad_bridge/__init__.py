@@ -16,6 +16,7 @@ NVS — it is never part of the YAML configuration.
 
 from __future__ import annotations
 
+import gzip
 import logging
 from pathlib import Path
 
@@ -23,24 +24,34 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome import automation
-from esphome.components import button, event, text_sensor
+from esphome.components import button, event, sensor, text_sensor
 from esphome.components.esp32 import (
     add_idf_component,
     add_idf_sdkconfig_option,
     include_builtin_idf_component,
 )
-from esphome.const import CONF_ID, CONF_TRIGGER_ID, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC
+from esphome.const import (
+    CONF_BATTERY_LEVEL,
+    CONF_ID,
+    CONF_TRIGGER_ID,
+    DEVICE_CLASS_BATTERY,
+    ENTITY_CATEGORY_CONFIG,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+    STATE_CLASS_MEASUREMENT,
+    UNIT_PERCENT,
+)
 from esphome.core import CORE, HexInt
 
 LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@pierluigizagaria"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["event", "text_sensor", "button"]
+AUTO_LOAD = ["event", "text_sensor", "button", "sensor"]
 MULTI_CONF = False
 
 CONF_KEYPAD_ACTION = "keypad_action"
 CONF_KEYPAD = "keypad"
+CONF_BATTERY_SCAN_INTERVAL = "battery_scan_interval"
 CONF_UNPAIR_BUTTON = "unpair_button"
 CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
@@ -96,6 +107,18 @@ CONFIG_SCHEMA = cv.Schema(
             icon="mdi:dialpad",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
+        # The keypad broadcasts its battery in its BLE advertisement; the
+        # bridge picks it up with a short background scan once per interval.
+        cv.Optional(CONF_BATTERY_LEVEL): sensor.sensor_schema(
+            unit_of_measurement=UNIT_PERCENT,
+            device_class=DEVICE_CLASS_BATTERY,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            accuracy_decimals=0,
+        ),
+        cv.Optional(
+            CONF_BATTERY_SCAN_INTERVAL, default="15min"
+        ): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_PAIRING_UI): _deprecated_pairing_ui,
         cv.Optional(CONF_UNPAIR_BUTTON): button.button_schema(
             UnpairButton,
@@ -175,6 +198,15 @@ async def to_code(config):
         sens = await text_sensor.new_text_sensor(keypad_sensor_conf)
         cg.add(var.set_keypad_text_sensor(sens))
 
+    if battery_conf := config.get(CONF_BATTERY_LEVEL):
+        batt = await sensor.new_sensor(battery_conf)
+        cg.add(var.set_battery_level_sensor(batt))
+        cg.add(
+            var.set_battery_scan_interval(
+                config[CONF_BATTERY_SCAN_INTERVAL].total_milliseconds
+            )
+        )
+
     if button_conf := config.get(CONF_UNPAIR_BUTTON):
         btn = await button.new_button(button_conf)
         await cg.register_parented(btn, config[CONF_ID])
@@ -187,10 +219,12 @@ async def to_code(config):
     cg.add_define("USE_WEBSERVER")
     cg.add_define("USE_WEBSERVER_PORT", 80)
 
-    # Bake the pairing wizard's HTML straight into the firmware image as a
-    # PROGMEM array. `pairing_ui.html` is the single source of truth — no
-    # generated header to commit, no build step to run by hand.
-    html_bytes = PAIRING_UI_HTML.read_bytes()
+    # Bake the pairing wizard's HTML into the firmware image as a
+    # gzip-compressed PROGMEM array (~4x smaller; served with
+    # Content-Encoding: gzip). `pairing_ui.html` is the single source of
+    # truth — no generated header to commit, no build step to run by hand.
+    # mtime=0 keeps the gzip header (and thus the build) reproducible.
+    html_bytes = gzip.compress(PAIRING_UI_HTML.read_bytes(), mtime=0)
     html_arr = cg.progmem_array(
         config[CONF_PAIRING_UI_HTML_ID], [HexInt(b) for b in html_bytes]
     )

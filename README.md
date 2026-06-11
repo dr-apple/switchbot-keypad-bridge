@@ -25,6 +25,8 @@ lock.
 - 🔔 **Doorbell, no lock needed** — on Keypad Vision the doorbell button is
   enabled automatically during pairing (the app normally hides it until a lock
   is bound) and each press fires its own Home Assistant event.
+- 🔋 **Battery monitoring** — the keypad's battery level, exposed as a
+  diagnostic sensor.
 - 🔐 **Keys never leave the device** — the AES-128 session key is generated on
   the ESP32 and stored in NVS; it is never in your YAML or git.
 - 🧩 **Pure ESPHome** — exposes a standard `event` entity plus `on_lock` /
@@ -32,11 +34,10 @@ lock.
 
 ## Supported keypads
 
-The pairing wizard identifies the keypad model **from its BLE advertisement** —
-the same way the official [pySwitchbot](https://github.com/sblibs/pySwitchbot)
-library does — and adapts the pairing protocol accordingly. Detection does not
-depend on the cloud `device_type`/SKU string at all, so a keypad is found and
-paired even if its SKU is one SwitchBot hasn't shipped before.
+The wizard identifies the keypad model **from its BLE advertisement**
+(pySwitchbot-style) and adapts the pairing protocol accordingly. Detection
+never touches the cloud SKU string, so even a keypad with a brand-new SKU
+pairs fine.
 
 | Model | Protocol family | Status |
 |---|---|---|
@@ -103,57 +104,24 @@ Every `on_unlock` trigger carries two values:
 | `method` | `std::string` | `"pin"`, `"fingerprint"`, `"nfc"`, `"face"`, or `"unknown"` |
 | `index` | `int` | Numeric ID of the credential slot |
 
-**`index` is the slot the SwitchBot app assigns automatically when you add a
-PIN, fingerprint, NFC card, or face** — the first credential gets index `0`, the second
-`1`, and so on. Combined with `method`, it tells you exactly which family member
-is at the door.
+`index` is the slot the SwitchBot app assigns when you add a credential — first
+one gets `0`, the next `1`, and so on. Combined with `method`, it tells you
+exactly who is at the door.
 
-The cleanest pattern is to forward both values to Home Assistant as a custom
-event with `homeassistant.event`, then build per-user automations entirely in HA
-without recompiling the firmware:
+The cleanest pattern: forward both values to Home Assistant as a custom event
+and build per-user automations there, without recompiling the firmware:
 
 ```yaml
 switchbot_keypad_bridge:
-  keypad_action:
-    name: "Action"
-
   on_unlock:
-    # Forward method and index to Home Assistant as a custom event.
     - homeassistant.event:
         event: esphome.switchbot_keypad_unlock
         data:
           method: !lambda 'return method;'
           index: !lambda 'return to_string(index);'
-
-    # Or react directly on the ESP32 — e.g. a different action per user.
-    - if:
-        condition:
-          lambda: 'return method == "fingerprint" && index == 0;'
-        then:
-          - logger.log: "Welcome home, owner"
-
-  on_lock:
-    - logger.log: "Locked"
 ```
 
-On the Home Assistant side, create an automation (**Settings → Automations → New
-automation → ⋮ → Edit in YAML**) and paste:
-
-```yaml
-alias: Notify on keypad unlock
-triggers:
-  - trigger: event
-    event_type: esphome.switchbot_keypad_unlock
-actions:
-  - action: notify.mobile_app
-    data:
-      message: >
-        Door unlocked via {{ trigger.event.data.method }}
-        (credential #{{ trigger.event.data.index }})
-```
-
-To react only to a specific credential, add a `conditions:` block. This example
-fires only for the first fingerprint (index `0`):
+Then in Home Assistant, one automation per credential:
 
 ```yaml
 alias: Welcome home — owner fingerprint
@@ -171,42 +139,38 @@ actions:
       message: Welcome home!
 ```
 
-Create one automation per credential to send tailored notifications or trigger
-different actions for each family member.
-
 ## Doorbell (Keypad Vision)
 
-The Keypad Vision has a dedicated doorbell button. The official app only lets
-you enable it once a SwitchBot Lock is bound to your account — so the bridge
-turns it on for you, automatically, at the end of pairing. No lock required.
-
-Each press fires the `on_doorbell` trigger (no parameters) and a `Doorbell`
-event on the `event` entity. Forward it to Home Assistant the same way as an
-unlock:
+The official app hides the doorbell button until a SwitchBot Lock is bound to
+your account, so the bridge enables it automatically at the end of pairing.
+Each press fires the `on_doorbell` trigger and a `Doorbell` event:
 
 ```yaml
 switchbot_keypad_bridge:
-  keypad_action:
-    name: "Action"
-
   on_doorbell:
     - homeassistant.event:
         event: esphome.switchbot_keypad_doorbell
 ```
 
+> Vision family only — Original / Touch keypads have no doorbell button.
+
+## Keypad battery
+
+The keypad broadcasts its battery level in its BLE advertisement — the same
+source [pySwitchbot](https://github.com/sblibs/pySwitchbot) reads. Add the
+`battery_level` sensor and the bridge picks it up with a short background scan
+(every 15 minutes by default):
+
 ```yaml
-alias: Notify on keypad doorbell
-triggers:
-  - trigger: event
-    event_type: esphome.switchbot_keypad_doorbell
-actions:
-  - action: notify.mobile_app
-    data:
-      message: Someone's at the door
+switchbot_keypad_bridge:
+  battery_level:
+    name: "Keypad Battery"
+  battery_scan_interval: 15min
 ```
 
-> The doorbell button exists only on the Vision family; the option is skipped
-> for Original / Touch keypads, which have no doorbell.
+The scan targets the MAC saved at pairing time and is skipped while the keypad
+is connected or the wizard is busy. Keypads paired before this feature existed
+are adopted automatically from their advertisement — no re-pairing needed.
 
 ## Configuration reference
 
@@ -214,6 +178,8 @@ actions:
 |---|---|---|---|
 | `keypad_action` | event | no | Standard ESPHome `event` entity for keypad actions. Surfaces in HA as `event.<device>_action` with `Lock` / `Unlock` / `Doorbell` event types. |
 | `keypad` | text_sensor | no | Text sensor whose state is the display name of the paired keypad (Configuration category; empty if none). |
+| `battery_level` | sensor | no | Battery percentage of the paired keypad, read from its BLE advertisement (Diagnostic category). |
+| `battery_scan_interval` | time | no | How often the bridge scans for the keypad's advertisement to refresh `battery_level`. Default `15min`. |
 | `unpair_button` | button | no | Button that forgets the paired keypad, rotates the session key and re-opens the pairing wizard (no reboot). |
 | `on_lock` | automation | no | Triggered on every `lock` command. |
 | `on_unlock` | automation | no | Triggered on every `unlock` command — parameters `(std::string method, int index)`. |

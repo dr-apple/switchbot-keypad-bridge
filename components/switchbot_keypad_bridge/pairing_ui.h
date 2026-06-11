@@ -6,7 +6,7 @@
 //   GET  /                       → embedded HTML (single self-contained page)
 //   POST /api/login              → {email,password} → {region} | 401
 //   GET  /api/keypads            → [ {mac, name, model, online, rssi} ]
-//   POST /api/pair               → {mac} → {job_id}
+//   POST /api/pair               → {mac} → {job_id, labels: [step names]}
 //   GET  /api/pair/status        → {step, total, message, done, error}
 //
 // The server uses ESP-IDF's `esp_http_server` (already pulled in by NimBLE
@@ -20,9 +20,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 
 #include "cloud_client.h"
+#include "keypad_advert.h"
 #include "keypad_pairer.h"
 
 namespace esphome {
@@ -42,15 +44,19 @@ class PairingUi {
   // slot during pairing.
   void set_shared_key(const std::array<uint8_t, 16> &key) { this->shared_key_ = key; }
 
-  // The embedded UI page, baked into flash by codegen (see __init__.py).
+  // The embedded UI page, gzip-compressed and baked into flash by codegen
+  // (see __init__.py); served verbatim with Content-Encoding: gzip.
   // Not NUL-terminated, so the length is carried alongside the pointer.
   void set_html(const uint8_t *html, size_t len) {
     this->html_ = html;
     this->html_len_ = len;
   }
 
-  // Called once after a successful pairing with the keypad's display name.
-  void set_on_paired_callback(std::function<void(const std::string &)> cb) {
+  // Called once after a successful pairing with the keypad's display name,
+  // pretty MAC and protocol family (the latter two feed the battery scan).
+  using OnPairedCallback = std::function<void(
+      const std::string &name, const std::string &mac, KeypadFamily family)>;
+  void set_on_paired_callback(OnPairedCallback cb) {
     this->on_paired_cb_ = std::move(cb);
   }
 
@@ -78,7 +84,7 @@ class PairingUi {
   std::array<uint8_t, 16> shared_key_{};
   const uint8_t *html_{nullptr};
   size_t         html_len_{0};
-  std::function<void(const std::string &)> on_paired_cb_;
+  OnPairedCallback on_paired_cb_;
   // Identify the pairing this UI started. The success handler matches
   // Status::job_id against pairing_job_id_ before firing on_paired_cb_,
   // so a previous job's lingering SUCCESS can never apply the wrong
@@ -86,6 +92,13 @@ class PairingUi {
   std::string    pairing_keypad_name_;
   std::string    pairing_job_id_;
   bool           success_notified_{false};
+
+  // Keypads identified from their BLE advertisement, keyed by pretty MAC. A
+  // keypad's model signature rides in the 0xFD3D service data, which for the
+  // Keypad Vision only arrives in the (intermittently received) scan response.
+  // Caching every positive identification keeps such a keypad listed on later
+  // scans where its service data was missed, as long as it's still in range.
+  std::map<std::string, KeypadIdent> identified_keypads_;
 };
 
 }  // namespace switchbot_keypad_bridge

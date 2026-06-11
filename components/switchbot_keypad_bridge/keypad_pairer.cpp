@@ -1,13 +1,15 @@
 #include "keypad_pairer.h"
 
 #include <host/ble_gap.h>
-#include <psa/crypto.h>
 
 #include <cstdio>
 #include <cstring>
 
 #include "esphome/core/log.h"
+#include "aes_ctr.h"
+#include "ble_utils.h"
 #include "keypad_advert.h"
+#include "mac_utils.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -64,13 +66,18 @@ constexpr FamilyPreset VISION_PRESET = {
     VISION_ENABLE_DOORBELL,    sizeof(VISION_ENABLE_DOORBELL),
 };
 
-const FamilyPreset &preset_for(CloudClient::KeypadFamily f) {
-  return f == CloudClient::KeypadFamily::VISION ? VISION_PRESET : ORIGINAL_PRESET;
+const FamilyPreset &preset_for(KeypadFamily f) {
+  return f == KeypadFamily::VISION ? VISION_PRESET : ORIGINAL_PRESET;
 }
 
 // Friendly step labels — kept short so the UI's progress card stays tidy.
-// Keep these in lock-step with the <ul class="stepper"> list in
-// pairing_ui.html: same count, same order, same wording.
+// The wizard fetches these through step_count()/step_label() (via the
+// /api/pair response) and builds its stepper from them, so this list is
+// the single source of truth for count, order and wording.
+//
+// The first BASE_STEP_COUNT entries are common to every family; the trailing
+// "Enabling doorbell" step exists only on the Vision family (Original/Touch
+// keypads have no doorbell).
 constexpr const char *STEP_LABELS[] = {
     "Connecting to keypad",
     "Discovering services",
@@ -80,48 +87,11 @@ constexpr const char *STEP_LABELS[] = {
     "Writing shared key (2/2)",
     "Updating lock target",
     "Finalising",
+    "Force-enabling doorbell",  // Vision-only
 };
-constexpr uint8_t TOTAL_STEPS = sizeof(STEP_LABELS) / sizeof(STEP_LABELS[0]);
-
-// AES-128-CTR via PSA Crypto. The keypad K14 only lives for the
-// duration of one pairing run, so we import the key fresh each time
-// and destroy it at the end of the call.  Same primitive the runtime
-// decrypt path uses — no extra IDF component dependency.
-bool aes_ctr_xcrypt(const uint8_t *key, const uint8_t iv[16],
-                    const uint8_t *in, uint8_t *out, size_t length) {
-  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
-  psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
-  psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
-  psa_set_key_bits(&attrs, 128);
-
-  psa_key_id_t key_id = PSA_KEY_ID_NULL;
-  psa_status_t s = psa_import_key(&attrs, key, 16, &key_id);
-  psa_reset_key_attributes(&attrs);
-  if (s != PSA_SUCCESS) return false;
-
-  psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
-  size_t out_len = 0, finish_len = 0;
-  s = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CTR);
-  if (s == PSA_SUCCESS) s = psa_cipher_set_iv(&op, iv, 16);
-  if (s == PSA_SUCCESS) s = psa_cipher_update(&op, in, length, out, length, &out_len);
-  if (s == PSA_SUCCESS) s = psa_cipher_finish(&op, out + out_len, length - out_len, &finish_len);
-  if (s != PSA_SUCCESS) psa_cipher_abort(&op);
-
-  psa_destroy_key(key_id);
-  return s == PSA_SUCCESS;
-}
-
-// Read the SwitchBot service-data blob from an advertisement (UUID 0xFD3D,
-// with the legacy 0x0D00 as a fallback). Empty when the device isn't
-// advertising SwitchBot service data.
-std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
-  static const NimBLEUUID U_FD3D(static_cast<uint16_t>(0xFD3D));
-  static const NimBLEUUID U_0D00(static_cast<uint16_t>(0x0D00));
-  std::string sd = adv->getServiceData(U_FD3D);
-  if (sd.empty()) sd = adv->getServiceData(U_0D00);
-  return std::vector<uint8_t>(sd.begin(), sd.end());
-}
+constexpr uint8_t BASE_STEP_COUNT   = 8;   // steps 0..7, every family
+constexpr uint8_t DOORBELL_STEP      = 8;   // index of the Vision-only step
+constexpr uint8_t VISION_STEP_COUNT = 9;   // base + doorbell
 
 // Briefly scan and look up the advertising packet of the target MAC so
 // we can connect with the right address type. The keypad's first byte
@@ -134,29 +104,19 @@ std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
 NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms,
                              KeypadIdent &ident_out) {
   NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->clearResults();
-  scan->setActiveScan(true);
-  scan->setInterval(45);
-  scan->setWindow(30);
+  configure_switchbot_scan(scan);
 
-  std::string target = mac_pretty;
-  for (auto &c : target) {
-    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-  }
+  const std::string target = upper_mac(mac_pretty);
 
   NimBLEScanResults results = scan->getResults(timeout_ms, false);
   for (int i = 0; i < results.getCount(); ++i) {
     const NimBLEAdvertisedDevice *adv = results.getDevice(i);
-    std::string found = adv->getAddress().toString();
-    for (auto &c : found) {
-      if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    }
-    if (found == target) {
+    if (upper_mac(adv->getAddress().toString()) == target) {
       const std::vector<uint8_t> sd = switchbot_service_data(adv);
       ident_out = identify_keypad(sd.data(), sd.size());
       ESP_LOGI(TAG, "Found keypad %s (addr_type=%d, advert=%s)",
                mac_pretty.c_str(), adv->getAddressType(),
-               ident_out.is_keypad ? ident_out.display_name : "unrecognised");
+               ident_out.is_keypad ? keypad_family_str(ident_out.family) : "unrecognised");
       return adv->getAddress();
     }
   }
@@ -166,6 +126,14 @@ NimBLEAddress discover_target(const std::string &mac_pretty, uint32_t timeout_ms
 }  // namespace
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+uint8_t KeypadPairer::step_count(KeypadFamily family) {
+  return family == KeypadFamily::VISION ? VISION_STEP_COUNT : BASE_STEP_COUNT;
+}
+
+const char *KeypadPairer::step_label(KeypadFamily family, uint8_t step) {
+  return step < step_count(family) ? STEP_LABELS[step] : "";
+}
 
 std::string KeypadPairer::start(Request req) {
   {
@@ -197,7 +165,7 @@ std::string KeypadPairer::start(Request req) {
   }
   while (xSemaphoreTake(this->ack_sem_, 0) == pdTRUE) { /* drain */ }
 
-  this->set_running_(TOTAL_STEPS, job_id);
+  this->set_running_(step_count(req_heap->family), job_id);
 
   // Spawn the task. The trampoline forwards to execute_() and frees the
   // request when done.
@@ -249,20 +217,23 @@ void KeypadPairer::set_running_(uint8_t total, const std::string &job_id) {
 }
 
 void KeypadPairer::set_step_(uint8_t step, const char *msg) {
-  ESP_LOGI(TAG, "Step %u/%u: %s", static_cast<unsigned>(step + 1),
-           static_cast<unsigned>(TOTAL_STEPS), msg);
   std::lock_guard<std::mutex> lk(this->mu_);
+  ESP_LOGI(TAG, "Step %u/%u: %s", static_cast<unsigned>(step + 1),
+           static_cast<unsigned>(this->status_.total), msg);
   this->status_.step    = step;
   this->status_.message = msg;
 }
 
-void KeypadPairer::set_success_() {
+void KeypadPairer::set_success_(const std::string &keypad_mac,
+                                KeypadFamily family) {
   ESP_LOGI(TAG, "Pairing successful");
   std::lock_guard<std::mutex> lk(this->mu_);
-  this->status_.state   = State::SUCCESS;
-  this->status_.step    = this->status_.total;
-  this->status_.message = "Pairing complete";
+  this->status_.state      = State::SUCCESS;
+  this->status_.step       = this->status_.total;
+  this->status_.message    = "Pairing complete";
   this->status_.error.clear();
+  this->status_.keypad_mac = keypad_mac;
+  this->status_.family     = family;
 }
 
 void KeypadPairer::set_failed_(const std::string &err) {
@@ -297,13 +268,15 @@ bool KeypadPairer::send_command_(NimBLERemoteCharacteristic *rx,
                                  const uint8_t *plaintext, size_t plaintext_len) {
   // Encrypted frame layout (same as the existing keypad command path):
   //   [0x57][key_id][IV[0]][IV[1]][AES-CTR(K14, IV, plaintext)]
+  // The keypad's K14 only lives for the duration of one pairing run, so it
+  // is imported fresh for each frame and destroyed right after.
   std::vector<uint8_t> frame(4 + plaintext_len);
   frame[0] = 0x57;
   frame[1] = this->key_id_;
   frame[2] = this->iv_[0];
   frame[3] = this->iv_[1];
-  if (!aes_ctr_xcrypt(this->key_.data(), this->iv_.data(),
-                      plaintext, frame.data() + 4, plaintext_len)) {
+  if (!aes_ctr_xcrypt_raw_key(this->key_.data(), this->iv_.data(),
+                              plaintext, frame.data() + 4, plaintext_len)) {
     return false;
   }
 
@@ -335,16 +308,14 @@ void KeypadPairer::execute_(Request &req) {
     return;
   }
 
-  // The keypad model — and therefore the pairing dialect — comes solely from
-  // the live advertisement. If we can't identify it, we don't guess.
-  if (!ident.is_keypad) {
-    this->set_failed_("Could not identify the keypad from its advertisement. "
-                      "Reset it into pairing mode, keep it within 2 m and retry.");
-    return;
-  }
-  ESP_LOGI(TAG, "Pairing %s as %s family", ident.display_name,
-           ident.family == CloudClient::KeypadFamily::VISION ? "VISION" : "ORIGINAL");
-  const FamilyPreset &preset = preset_for(ident.family);
+  // The pairing dialect follows the family already identified by the UI (from
+  // the BLE service-data signature, cached by MAC). We do NOT re-derive it from
+  // this scan: the Keypad Vision doesn't carry its signature on every
+  // advertisement, so discover_target may legitimately fail to classify it even
+  // though it is a keypad. The scan above was only needed for the address type.
+  const KeypadFamily family = req.family;
+  ESP_LOGI(TAG, "Pairing keypad as %s family", keypad_family_str(family));
+  const FamilyPreset &preset = preset_for(family);
 
   // The keypad might currently be connected to our peripheral (server) role —
   // it sends IV requests to us as a SwitchBot Lock emulation. The BLE spec
@@ -437,13 +408,23 @@ void KeypadPairer::execute_(Request &req) {
     this->set_failed_("enter_pairing rejected.");
     return;
   }
+  // Best-effort pair of frames: the capabilities probe is informational and
+  // the prep preamble is tolerated missing by every keypad we've captured.
   if (preset.capabilities_probe != nullptr) {
     this->send_command_(rx, preset.capabilities_probe, preset.capabilities_probe_len);
   }
   uint8_t prep[] = {0x06, 0x03};
   this->send_command_(rx, prep, sizeof(prep));
+  // slot_init is NOT best-effort: it opens the slot the shared key is written
+  // into on steps 4-5. Carrying on after a failed write would report SUCCESS
+  // for a keypad that never works.
   uint8_t slot_init[] = {0x0F, 0x20, 0x03, preset.shared_slot, preset.slot_init_nonce};
-  this->send_command_(rx, slot_init, sizeof(slot_init));
+  if (!this->send_command_(rx, slot_init, sizeof(slot_init))) {
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    this->set_failed_("Could not open the keypad's key slot.");
+    return;
+  }
 
   // Step 4: shared_key chunk 1.
   uint8_t tok1[5 + 8];
@@ -476,10 +457,14 @@ void KeypadPairer::execute_(Request &req) {
   uint8_t finalize2[] = {0x0f, 0x53, 0x01, 0x06};
   this->send_command_(rx, finalize2, sizeof(finalize2));
 
-  // Enable the doorbell by default while we hold an authenticated session
-  // (Vision only). Best-effort: an unsupported keypad just ACKs and ignores it.
+  // Step 8 (Vision only): enable the doorbell while we still hold an
+  // authenticated session. The slot is written and finalised, so this is the
+  // last safe moment to push a setting before disconnecting. Surfaced as its
+  // own step — the user sees it happen instead of it being a silent extra.
+  // Still best-effort: the keypad is already paired and usable, so a missing
+  // ACK here must not fail the whole job.
   if (preset.enable_doorbell != nullptr) {
-    ESP_LOGI(TAG, "Enabling doorbell button");
+    this->set_step_(DOORBELL_STEP, STEP_LABELS[DOORBELL_STEP]);
     this->send_command_(rx, preset.enable_doorbell, preset.enable_doorbell_len);
   }
 
@@ -487,7 +472,7 @@ void KeypadPairer::execute_(Request &req) {
   client->disconnect();
   NimBLEDevice::deleteClient(client);
 
-  this->set_success_();
+  this->set_success_(req.keypad_mac, family);
 }
 
 }  // namespace switchbot_keypad_bridge

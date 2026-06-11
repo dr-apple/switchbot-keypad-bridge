@@ -1,12 +1,16 @@
 #include "pairing_ui.h"
 
-#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <vector>
 
+#include <cJSON.h>
+
 #include "esphome/core/log.h"
+#include "ble_utils.h"
 #include "keypad_advert.h"
+#include "mac_utils.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -77,83 +81,52 @@ esp_err_t PairingUi::handle_root_(httpd_req_t *req) {
   }
   httpd_resp_set_type(req, "text/html; charset=utf-8");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  // The page is stored gzip-compressed in flash (see __init__.py). Served
+  // as-is without checking Accept-Encoding: every browser accepts gzip.
+  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
   return httpd_resp_send(req, reinterpret_cast<const char *>(self->html_),
                          static_cast<ssize_t>(self->html_len_));
 }
 
 namespace {
 
-// Minimal escaper for the JSON strings we emit. Handles the cases we
-// realistically see (quotes and backslashes inside device names).
-std::string json_escape(const std::string &s) {
-  std::string out;
-  out.reserve(s.size() + 8);
-  for (char c : s) {
-    switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-          out += buf;
-        } else {
-          out.push_back(c);
-        }
+// Serialize a cJSON node to a compact string, then free the node. cJSON owns
+// the escaping, so callers never hand-build JSON. Returns `fallback` if
+// allocation fails (only under OOM).
+std::string json_take(cJSON *node, const char *fallback = "{}") {
+  std::string out = fallback;
+  if (node != nullptr) {
+    char *s = cJSON_PrintUnformatted(node);
+    if (s != nullptr) {
+      out = s;
+      cJSON_free(s);
     }
+    cJSON_Delete(node);
   }
   return out;
 }
 
-// Pull a top-level JSON string property out of a request body. Returns
-// empty on missing/malformed. Tiny hand-rolled extractor — we only need
-// it for two fields and don't want to pull cJSON into the request path.
+// Pull a top-level JSON string property out of a request body. Returns empty
+// when the body isn't valid JSON or the field is absent / not a string.
 std::string extract_json_str(const std::string &body, const char *key) {
-  std::string needle = std::string("\"") + key + "\"";
-  size_t k = body.find(needle);
-  if (k == std::string::npos) return "";
-  size_t colon = body.find(':', k);
-  if (colon == std::string::npos) return "";
-  size_t open = body.find('"', colon);
-  if (open == std::string::npos) return "";
-  ++open;
+  cJSON *root = cJSON_ParseWithLength(body.data(), body.size());
+  if (root == nullptr) return "";
   std::string out;
-  while (open < body.size() && body[open] != '"') {
-    if (body[open] == '\\' && open + 1 < body.size()) {
-      char esc = body[open + 1];
-      switch (esc) {
-        case 'n': out.push_back('\n'); break;
-        case 'r': out.push_back('\r'); break;
-        case 't': out.push_back('\t'); break;
-        default:  out.push_back(esc);
-      }
-      open += 2;
-    } else {
-      out.push_back(body[open++]);
-    }
+  cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+  if (cJSON_IsString(item) && item->valuestring != nullptr) {
+    out = item->valuestring;
   }
+  cJSON_Delete(root);
   return out;
 }
 
 // One nearby BLE device: strongest RSSI seen plus its SwitchBot service-data
-// blob (so the UI can identify the keypad model the pySwitchbot way).
+// blob (so the UI can identify the keypad model the pySwitchbot way). rssi
+// starts below any real BLE reading so the first packet always wins.
 struct NearbyDevice {
-  int rssi{0};
+  int rssi{-128};
   std::vector<uint8_t> svc_data;
 };
-
-// Read the SwitchBot service-data blob from an advertisement (UUID 0xFD3D,
-// with the legacy 0x0D00 as a fallback). Empty when not present.
-std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
-  static const NimBLEUUID U_FD3D(static_cast<uint16_t>(0xFD3D));
-  static const NimBLEUUID U_0D00(static_cast<uint16_t>(0x0D00));
-  std::string sd = adv->getServiceData(U_FD3D);
-  if (sd.empty()) sd = adv->getServiceData(U_0D00);
-  return std::vector<uint8_t>(sd.begin(), sd.end());
-}
 
 // Active-scan for `duration_ms` and record, for each advertising address
 // (upper-case, colon-separated), the strongest RSSI and its SwitchBot service
@@ -162,26 +135,24 @@ std::vector<uint8_t> switchbot_service_data(const NimBLEAdvertisedDevice *adv) {
 std::map<std::string, NearbyDevice> scan_nearby(uint32_t duration_ms) {
   std::map<std::string, NearbyDevice> seen;
   NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->clearResults();
-  scan->setActiveScan(true);
-  scan->setInterval(45);
-  scan->setWindow(30);
+  configure_switchbot_scan(scan);
 
   NimBLEScanResults results = scan->getResults(duration_ms, false);
   for (int i = 0; i < results.getCount(); ++i) {
     const NimBLEAdvertisedDevice *adv = results.getDevice(i);
-    std::string mac = adv->getAddress().toString();
-    for (auto &c : mac) {
-      if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    }
+    const std::string mac = upper_mac(adv->getAddress().toString());
     const int rssi = adv->getRSSI();
-    auto it = seen.find(mac);
-    if (it == seen.end() || rssi > it->second.rssi) {
-      NearbyDevice &dev = seen[mac];
-      dev.rssi = rssi;
-      std::vector<uint8_t> sd = switchbot_service_data(adv);
-      if (!sd.empty()) dev.svc_data = std::move(sd);
-    }
+    NearbyDevice &dev = seen[mac];  // inserts a default entry on first sight
+    if (rssi > dev.rssi) dev.rssi = rssi;
+    // The 0xFD3D service data rides in the scan response, which usually arrives
+    // as a separate packet at a different RSSI than the plain advertisement.
+    // Capture it whenever a packet carries it — independent of RSSI. Gating this
+    // on "strongest RSSI seen" (as before) dropped a keypad's service data
+    // whenever its adv packet was stronger than its scan response, leaving the
+    // device looking like a non-keypad. With two keypads in range that flakily
+    // hid one or the other depending on packet order.
+    std::vector<uint8_t> sd = switchbot_service_data(adv);
+    if (!sd.empty()) dev.svc_data = std::move(sd);
   }
   scan->clearResults();
   return seen;
@@ -204,10 +175,9 @@ esp_err_t PairingUi::handle_login_(httpd_req_t *req) {
     ESP_LOGW(TAG, "Login failed: %s", err.c_str());
     return reply_error_(req, "401 Unauthorized", err);
   }
-  std::string resp = R"json({"region":")json";
-  resp += json_escape(self->cloud_.region());
-  resp += R"json("})json";
-  return reply_json_(req, resp.c_str());
+  cJSON *resp = cJSON_CreateObject();
+  cJSON_AddStringToObject(resp, "region", self->cloud_.region().c_str());
+  return reply_json_(req, json_take(resp).c_str());
 }
 
 esp_err_t PairingUi::handle_keypads_(httpd_req_t *req) {
@@ -215,64 +185,64 @@ esp_err_t PairingUi::handle_keypads_(httpd_req_t *req) {
   if (!self->cloud_.is_logged_in()) {
     return reply_error_(req, "401 Unauthorized", "Sign in first.");
   }
-  std::vector<CloudClient::AccountKeypad> keypads;
+  std::vector<CloudClient::AccountDevice> devices;
   std::string err;
-  if (!self->cloud_.list_keypads(keypads, err)) {
-    ESP_LOGW(TAG, "list_keypads failed: %s", err.c_str());
+  if (!self->cloud_.list_devices(devices, err)) {
+    ESP_LOGW(TAG, "list_devices failed: %s", err.c_str());
     return reply_error_(req, "502 Bad Gateway", err);
   }
 
   // Cross-reference the account devices against a fresh BLE scan: this both
   // shows which ones are in range (and how strong the signal is) and identifies
   // the keypad model straight from the advertisement (pySwitchbot-style).
-  const std::map<std::string, NearbyDevice> nearby = scan_nearby(4000);
+  // 8 s: keypads are battery devices that advertise infrequently when idle, and
+  // the radio is time-shared with WiFi and the lock advertising — a short window
+  // often catches only one of several keypads. A longer scan reliably finds all.
+  const std::map<std::string, NearbyDevice> nearby = scan_nearby(8000);
 
-  std::string out = "[";
+  cJSON *arr = cJSON_CreateArray();
   unsigned shown = 0;
-  for (const auto &k : keypads) {
+  for (const auto &k : devices) {
     const auto hit = nearby.find(k.mac_pretty);
-    if (hit == nearby.end() || hit->second.svc_data.empty()) continue;
+    if (hit == nearby.end()) continue;  // not in BLE range right now
 
-    // A device is a keypad only if its live advertisement matches a known
-    // SwitchBot keypad signature. Everything else (locks, bots, hubs, …) and
-    // any out-of-range device is skipped — detection is BLE-only.
-    const KeypadIdent ident = identify_keypad(hit->second.svc_data.data(),
-                                              hit->second.svc_data.size());
+    // Identify from the live advertisement. A keypad's signature rides in the
+    // 0xFD3D service data, which for the Keypad Vision only arrives in the
+    // (intermittently received) scan response. So cache every positive
+    // identification by MAC and fall back to it on later scans where the
+    // service data was missed — as long as the device is still in range. This
+    // is what keeps the Vision from flickering in and out of the list.
+    KeypadIdent ident =
+        identify_keypad(hit->second.svc_data.data(), hit->second.svc_data.size());
+    if (ident.is_keypad) {
+      self->identified_keypads_[k.mac_pretty] = ident;
+    } else {
+      const auto cached = self->identified_keypads_.find(k.mac_pretty);
+      if (cached != self->identified_keypads_.end()) ident = cached->second;
+    }
     if (!ident.is_keypad) continue;
 
-    if (shown++ != 0) out += ",";
-    out += R"json({"mac":")json";
-    out += json_escape(k.mac_pretty);
-    out += R"json(","name":")json";
-    out += json_escape(k.name);
-    out += R"json(","model":")json";
-    out += json_escape(ident.display_name);
-    out += R"json(","online":true,"rssi":)json";
-    out += std::to_string(hit->second.rssi);
-    out += "}";
+    ESP_LOGI(TAG, "keypad '%s' %s family=%s rssi=%d", k.name.c_str(),
+             k.mac_pretty.c_str(), keypad_family_str(ident.family),
+             hit->second.rssi);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "mac", k.mac_pretty.c_str());
+    cJSON_AddStringToObject(o, "name", k.name.c_str());
+    // The pairing dialect (and which steps the wizard shows) follows from the
+    // family detected here. The browser echoes it back on /api/pair so the
+    // step list is correct before the pairer re-confirms it over BLE.
+    cJSON_AddStringToObject(o, "family", keypad_family_str(ident.family));
+    cJSON_AddBoolToObject(o, "online", true);
+    cJSON_AddNumberToObject(o, "rssi", hit->second.rssi);
+    cJSON_AddItemToArray(arr, o);
+    ++shown;
   }
-  out += "]";
   ESP_LOGI(TAG, "GET /api/keypads -> %u keypad(s) of %u account device(s), %u nearby",
-           shown, static_cast<unsigned>(keypads.size()),
+           shown, static_cast<unsigned>(devices.size()),
            static_cast<unsigned>(nearby.size()));
-  return reply_json_(req, out.c_str());
+  return reply_json_(req, json_take(arr, "[]").c_str());
 }
-
-namespace {
-
-// Read the ESP's BLE peripheral address as a 6-byte big-endian array
-// (MAC[0] is the leading byte). NimBLEAddress stores the bytes in
-// little-endian internally so we reverse on the way out.
-std::array<uint8_t, 6> esp_ble_mac() {
-  std::array<uint8_t, 6> out{};
-  const uint8_t *raw = NimBLEDevice::getAddress().getBase()->val;
-  for (size_t i = 0; i < 6; ++i) {
-    out[i] = raw[5 - i];
-  }
-  return out;
-}
-
-}  // namespace
 
 esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   auto *self = static_cast<PairingUi *>(req->user_ctx);
@@ -281,24 +251,26 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   if (mac.empty()) {
     return reply_error_(req, "400 Bad Request", "Missing keypad mac.");
   }
-  ESP_LOGI(TAG, "POST /api/pair mac=%s", mac.c_str());
+  // Family as identified by /api/keypads and echoed back by the browser. It
+  // sizes the step list shown during pairing; the pairer re-confirms it from
+  // the live advertisement before acting.
+  const KeypadFamily family = keypad_family_from_str(extract_json_str(body, "family").c_str());
+  ESP_LOGI(TAG, "POST /api/pair mac=%s family=%s", mac.c_str(), keypad_family_str(family));
 
   if (!self->cloud_.is_logged_in()) {
     return reply_error_(req, "401 Unauthorized", "Sign in first.");
   }
 
   // Confirm the MAC belongs to this account (and grab its pretty form + name).
-  // The protocol family is determined later by the pairer from the keypad's
-  // live BLE advertisement.
-  std::vector<CloudClient::AccountKeypad> keypads;
+  std::vector<CloudClient::AccountDevice> devices;
   std::string err;
-  if (!self->cloud_.list_keypads(keypads, err)) {
+  if (!self->cloud_.list_devices(devices, err)) {
     return reply_error_(req, "502 Bad Gateway", err);
   }
-  const CloudClient::AccountKeypad *found = nullptr;
-  for (const auto &kp : keypads) {
-    if (kp.mac_pretty == mac || kp.mac == mac) {
-      found = &kp;
+  const CloudClient::AccountDevice *found = nullptr;
+  for (const auto &dev : devices) {
+    if (dev.mac_pretty == mac || dev.mac == mac) {
+      found = &dev;
       break;
     }
   }
@@ -319,10 +291,11 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   // Build the pairer's request.
   KeypadPairer::Request kr;
   kr.keypad_mac  = found->mac_pretty;
+  kr.family      = family;
   kr.key_id     = static_cast<int>(std::strtol(key_id_hex.c_str(), nullptr, 16));
   kr.key        = std::move(key_bytes);
   kr.shared_token = self->shared_key_;
-  kr.esp_mac = esp_ble_mac();
+  kr.esp_mac = addr_bytes(NimBLEDevice::getAddress());
 
   // Capture the name now — it belongs to this exact job.
   const std::string keypad_name = found->name;
@@ -338,10 +311,16 @@ esp_err_t PairingUi::handle_pair_(httpd_req_t *req) {
   self->pairing_keypad_name_ = keypad_name;
   self->pairing_job_id_      = job_id;
   self->success_notified_    = false;
-  std::string resp = R"json({"job_id":")json";
-  resp += job_id;
-  resp += R"json("})json";
-  return reply_json_(req, resp.c_str());
+  cJSON *resp = cJSON_CreateObject();
+  cJSON_AddStringToObject(resp, "job_id", job_id.c_str());
+  // Step labels for the progress stepper — the wizard renders these, so the
+  // pairer stays the single source of truth for count, order and wording.
+  // The Vision family has one extra step (enabling the doorbell).
+  cJSON *labels = cJSON_AddArrayToObject(resp, "labels");
+  for (uint8_t i = 0; i < KeypadPairer::step_count(family); ++i) {
+    cJSON_AddItemToArray(labels, cJSON_CreateString(KeypadPairer::step_label(family, i)));
+  }
+  return reply_json_(req, json_take(resp).c_str());
 }
 
 esp_err_t PairingUi::handle_pair_status_(httpd_req_t *req) {
@@ -354,31 +333,25 @@ esp_err_t PairingUi::handle_pair_status_(httpd_req_t *req) {
   if (st.state == KeypadPairer::State::SUCCESS && !self->success_notified_ &&
       st.job_id == self->pairing_job_id_ && !self->pairing_job_id_.empty()) {
     self->success_notified_ = true;
-    if (self->on_paired_cb_) self->on_paired_cb_(self->pairing_keypad_name_);
+    if (self->on_paired_cb_) {
+      self->on_paired_cb_(self->pairing_keypad_name_, st.keypad_mac, st.family);
+    }
   }
 
-  bool done = st.state == KeypadPairer::State::SUCCESS ||
-              st.state == KeypadPairer::State::FAILED;
+  const bool done = st.state == KeypadPairer::State::SUCCESS ||
+                    st.state == KeypadPairer::State::FAILED;
 
-  std::string resp = "{";
-  resp += R"json("step":)json";
-  resp += std::to_string(st.step);
-  resp += R"json(,"total":)json";
-  resp += std::to_string(st.total);
-  resp += R"json(,"message":")json";
-  resp += json_escape(st.message);
-  resp += R"json(","done":)json";
-  resp += done ? "true" : "false";
-  resp += R"json(,"error":)json";
+  cJSON *resp = cJSON_CreateObject();
+  cJSON_AddNumberToObject(resp, "step", st.step);
+  cJSON_AddNumberToObject(resp, "total", st.total);
+  cJSON_AddStringToObject(resp, "message", st.message.c_str());
+  cJSON_AddBoolToObject(resp, "done", done);
   if (st.state == KeypadPairer::State::FAILED) {
-    resp += R"json(")json";
-    resp += json_escape(st.error);
-    resp += R"json(")json";
+    cJSON_AddStringToObject(resp, "error", st.error.c_str());
   } else {
-    resp += "null";
+    cJSON_AddNullToObject(resp, "error");
   }
-  resp += "}";
-  return reply_json_(req, resp.c_str());
+  return reply_json_(req, json_take(resp).c_str());
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -393,18 +366,9 @@ esp_err_t PairingUi::reply_json_(httpd_req_t *req, const char *json,
 
 esp_err_t PairingUi::reply_error_(httpd_req_t *req, const char *status,
                                   const std::string &message) {
-  std::string body = R"json({"error":")json";
-  for (char c : message) {
-    if (c == '"' || c == '\\') body.push_back('\\');
-    if (c == '\n' || c == '\r' || c == '\t') {
-      body += "\\";
-      body.push_back(c == '\n' ? 'n' : (c == '\r' ? 'r' : 't'));
-    } else {
-      body.push_back(c);
-    }
-  }
-  body += R"json("})json";
-  return reply_json_(req, body.c_str(), status);
+  cJSON *body = cJSON_CreateObject();
+  cJSON_AddStringToObject(body, "error", message.c_str());
+  return reply_json_(req, json_take(body).c_str(), status);
 }
 
 std::string PairingUi::read_body_(httpd_req_t *req) {
@@ -415,13 +379,18 @@ std::string PairingUi::read_body_(httpd_req_t *req) {
   if (req->content_len == 0 || req->content_len > MAX_BODY_LEN) {
     return buf;
   }
+  // httpd_req_recv may legitimately return less than content_len (the body
+  // can arrive split across TCP segments), so keep reading until complete.
   buf.resize(req->content_len);
-  int received = httpd_req_recv(req, buf.data(),
-                                static_cast<int>(req->content_len));
-  if (received <= 0) {
-    buf.clear();
-  } else {
-    buf.resize(received);
+  size_t received = 0;
+  while (received < req->content_len) {
+    int r = httpd_req_recv(req, buf.data() + received,
+                           static_cast<int>(req->content_len - received));
+    if (r <= 0) {
+      buf.clear();
+      return buf;
+    }
+    received += static_cast<size_t>(r);
   }
   return buf;
 }

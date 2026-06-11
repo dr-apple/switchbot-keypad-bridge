@@ -14,15 +14,7 @@
 // Spawned once per pairing attempt; the HTTP handler polls `status()`
 // at ~2 Hz from the UI's `/api/pair/status`.
 
-#include <NimBLEDevice.h>
-
-// NimBLE leaks LOG_LEVEL_* macros that collide with ESPHome's enum.
-#undef LOG_LEVEL_NONE
-#undef LOG_LEVEL_ERROR
-#undef LOG_LEVEL_WARN
-#undef LOG_LEVEL_INFO
-#undef LOG_LEVEL_DEBUG
-#undef LOG_LEVEL_CRITICAL
+#include "nimble_compat.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -35,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include "cloud_client.h"
+#include "keypad_advert.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -57,13 +49,19 @@ class KeypadPairer {
     std::string message;       // human-readable status of the current step
     std::string error;         // populated when state == FAILED
     std::string job_id;        // matches the value returned by start()
+    // Identity of the keypad just paired, valid only when state == SUCCESS.
+    // The family comes from the live advertisement read during discovery.
+    std::string keypad_mac;    // pretty form, e.g. "B0:E9:FE:..."
+    KeypadFamily family{KeypadFamily::ORIGINAL};
   };
 
-  // Arguments for a single pairing attempt. The protocol family is NOT passed
-  // in — the pairer reads it from the keypad's live BLE advertisement during
-  // discovery (keypad_advert.h), which is the single source of truth.
+  // Arguments for a single pairing attempt. `family` comes from the UI's
+  // advertisement-based identification (keypad_advert.h) and decides the step
+  // list shown; the pairer re-confirms it from the live advert during
+  // discovery and that live value drives the actual protocol dialect.
   struct Request {
     std::string                  keypad_mac;       // pretty form, e.g. "B0:E9:FE:..."
+    KeypadFamily                 family{KeypadFamily::ORIGINAL};
     int                          key_id{0};        // 0x88 / 0xC6 / ... from cloud
     std::vector<uint8_t>         key;              // 16-byte AES-CTR key from cloud
     std::array<uint8_t, 16>      shared_token{};   // the random key we inject
@@ -75,6 +73,13 @@ class KeypadPairer {
   // untouched — only one pairing can be in flight at a time.
   std::string start(Request req);
 
+  // The user-facing label of each pairing step, in order. The wizard builds
+  // its progress stepper from these (returned by /api/pair), so the pairer
+  // is the single source of truth for step count, order and wording. The
+  // Vision family has one extra trailing step (enabling the doorbell).
+  static uint8_t step_count(KeypadFamily family);
+  static const char *step_label(KeypadFamily family, uint8_t step);
+
   // Atomic snapshot of progress. Suitable for polling from any thread.
   Status status() const;
 
@@ -84,7 +89,7 @@ class KeypadPairer {
   // Step helpers (push step number + message, log, return immediately).
   void set_step_(uint8_t step, const char *msg);
   void set_running_(uint8_t total, const std::string &job_id);
-  void set_success_();
+  void set_success_(const std::string &keypad_mac, KeypadFamily family);
   void set_failed_(const std::string &err);
 
   // BLE notification sink: we look for the 20-byte session-IV response

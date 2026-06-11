@@ -1,6 +1,5 @@
 #pragma once
 
-#include <NimBLEDevice.h>
 #include <psa/crypto.h>
 
 #include <array>
@@ -13,6 +12,7 @@
 
 #include "esphome/components/button/button.h"
 #include "esphome/components/event/event.h"
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
@@ -20,17 +20,10 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/preferences.h"
 
+#include "lock_protocol.h"
+#include "lock_session.h"
+#include "nimble_compat.h"
 #include "pairing_ui.h"
-
-// NimBLE's log_common.h defines LOG_LEVEL_* as plain macros, which collide
-// with identically-named members of ESPHome enums included downstream.
-// ESPHome uses ESPHOME_LOG_LEVEL_* for its own logging, so these undefs are safe.
-#undef LOG_LEVEL_NONE
-#undef LOG_LEVEL_ERROR
-#undef LOG_LEVEL_WARN
-#undef LOG_LEVEL_INFO
-#undef LOG_LEVEL_DEBUG
-#undef LOG_LEVEL_CRITICAL
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -38,18 +31,32 @@ namespace switchbot_keypad_bridge {
 // Upper bound (including the trailing NUL) on the persisted keypad name.
 constexpr size_t KEYPAD_NAME_MAX = 48;
 
-enum class UnlockMethod : uint8_t {
-  UNKNOWN = 0x00,
-  PIN = 0x04,
-  NFC = 0x08,
-  FINGERPRINT = 0x0C,
-  FACE = 0x18,
-};
+// The protocol layers live next door: lock_protocol.h decodes plaintext
+// frames, lock_session.h owns the encrypted-session state machine (IV,
+// anti-replay, transport crypto). This component is the NimBLE transport
+// and the ESPHome-facing business logic on top of them.
 
-const char *unlock_method_name(UnlockMethod method);
-
+// ── Concurrency model ───────────────────────────────────────────────────────
+// Four execution contexts touch this component. The rule of thumb: only the
+// main task acts; every other context hands data over and returns.
+//
+//   1. ESPHome main task — setup()/loop() and everything they call. The only
+//      context that publishes entities, writes NVS, or mutates session and
+//      battery-scan state.
+//   2. NimBLE host task — server/characteristic callbacks and the battery
+//      scan callback. They only enqueue: connect/disconnect/RX frames into
+//      rx_queue_, battery adverts into the battery_advert_* fields — both
+//      under rx_mutex_, both drained by loop().
+//   3. HTTP-server task (pairing wizard) — signals a finished pairing through
+//      the pending_keypad_* fields plus the pending_pair_apply_ flag. The
+//      fields are written first, then the flag is stored with release
+//      semantics; loop() exchanges the flag with acquire before reading them.
+//      When adding a pending field, write it BEFORE the flag store.
+//   4. Pairing FreeRTOS task ("kp-pair") — owned by KeypadPairer, which
+//      exposes progress as Status snapshots copied under its own mutex.
 class SwitchbotKeypadBridge : public Component {
   SUB_TEXT_SENSOR(keypad)
+  SUB_SENSOR(battery_level)
 
  public:
   void setup() override;
@@ -61,6 +68,7 @@ class SwitchbotKeypadBridge : public Component {
   void set_pairing_ui_html(const uint8_t *html, size_t len) {
     this->pairing_ui_.set_html(html, len);
   }
+  void set_battery_scan_interval(uint32_t ms) { this->battery_scan_interval_ms_ = ms; }
 
   bool is_pairing_active() const { return this->pairing_ui_.is_running(); }
 
@@ -81,33 +89,24 @@ class SwitchbotKeypadBridge : public Component {
  protected:
   class ServerCallbacks;
   class RxCharCallbacks;
+  class BatteryScanCallbacks;
   friend class ServerCallbacks;
   friend class RxCharCallbacks;
+  friend class BatteryScanCallbacks;
 
   enum class LockState : uint8_t {
     LOCKED = 0x81,
     UNLOCKED = 0x91,
   };
 
-  enum class CommandType : uint8_t {
-    UNKNOWN,
-    LOCK,
-    UNLOCK,
-    STATE_POLL,
-    DOORBELL,
-  };
-
-  // 4-byte transport header echoed back on every encrypted exchange.
-  struct FrameHeader {
-    uint8_t key_id;
-    uint8_t seq_a;
-    uint8_t seq_b;
-  };
-
-  struct DecodedCommand {
-    CommandType type{CommandType::UNKNOWN};
-    UnlockMethod method{UnlockMethod::UNKNOWN};
-    int16_t credential_index{-1};
+  // Identity of the paired keypad, persisted to NVS at pairing time so the
+  // battery scan can match its advertisement after a reboot. `valid == 0`
+  // for keypads paired before this field existed — the scan then learns the
+  // MAC from the first recognised keypad advert and persists it.
+  struct KeypadInfo {
+    uint8_t mac[6]{};   // big-endian, as printed
+    uint8_t family{0};  // KeypadFamily
+    uint8_t valid{0};
   };
 
   // ----- Configuration / setup -----------------------------------------------
@@ -124,11 +123,10 @@ class SwitchbotKeypadBridge : public Component {
 
   // ----- BLE write handling --------------------------------------------------
 
+  // Validation, decryption and decoding live in LockSession; the bridge
+  // dispatches the resulting Action and owns the business logic.
   void on_rx_frame_(const std::string &frame);
-  bool is_session_iv_request_(const std::string &frame) const;
-  void send_session_iv_();
 
-  bool decode_command_(const uint8_t *plaintext, size_t length, DecodedCommand &out) const;
   void handle_command_(const FrameHeader &header, const DecodedCommand &command);
   void handle_state_poll_(const FrameHeader &header);
 
@@ -138,23 +136,21 @@ class SwitchbotKeypadBridge : public Component {
   void send_encrypted_response_(const FrameHeader &header, const uint8_t *plaintext, size_t length);
   void notify_(const uint8_t *data, size_t length);
 
-  // ----- Crypto (AES-CTR is symmetric, so a single primitive covers both ways) -
-
-  bool aes_ctr_xcrypt_(const uint8_t *input, size_t length, uint8_t *output);
-  void rotate_session_iv_();
-
-  // ----- Anti-replay ---------------------------------------------------------
-
-  void reset_session_state_();
-  void clear_replay_history_();
-  bool is_replayed_ciphertext_(const uint8_t *ciphertext, size_t length) const;
-  void record_ciphertext_(const uint8_t *ciphertext, size_t length);
-
   // ----- Eventing ------------------------------------------------------------
 
   void publish_lock_();
   void publish_unlock_(UnlockMethod method, int index);
   void publish_doorbell_();
+
+  // ----- Keypad battery (advertisement scan) ----------------------------------
+
+  // The keypad broadcasts its battery level in its BLE advertisement (the
+  // command frames it sends us never carry it). A short active scan picks
+  // the advert up while the bridge keeps advertising as the lock.
+  void maybe_start_battery_scan_();
+  void apply_pending_battery_();
+  // Runs on the NimBLE host task — parses the advert and queues the result.
+  void handle_battery_advert_(const NimBLEAdvertisedDevice *adv);
 
   // ----- BLE handles ---------------------------------------------------------
 
@@ -186,6 +182,8 @@ class SwitchbotKeypadBridge : public Component {
   // read once the flag is observed.
   std::atomic<bool> pending_pair_apply_{false};
   std::string pending_keypad_name_;
+  std::string pending_keypad_mac_;
+  KeypadFamily pending_keypad_family_{KeypadFamily::ORIGINAL};
 
   // ----- ESPHome wiring ------------------------------------------------------
 
@@ -201,11 +199,6 @@ class SwitchbotKeypadBridge : public Component {
   std::array<uint8_t, 16> shared_key_{};
   ESPPreferenceObject shared_key_pref_;
   ESPPreferenceObject keypad_name_pref_;
-  // Token-slot key_id the keypad uses post-pairing. Auto-learned from the
-  // IV-request frame the keypad sends as the first message of every session
-  // (Original/Touch=0x88, Vision/Vision Pro=0xC6, …). 0x00 = not yet seen;
-  // no encrypted frame is accepted until the IV handshake has set it.
-  uint8_t shared_slot_id_{0x00};
 
   // ----- Runtime state -------------------------------------------------------
 
@@ -214,21 +207,30 @@ class SwitchbotKeypadBridge : public Component {
   psa_key_id_t aes_key_handle_{PSA_KEY_ID_NULL};
   LockState lock_state_{LockState::LOCKED};
 
-  // 20-byte session IV response: [0x01, 0x00, 0x00, 0x00, IV(16)].
-  // The trailing 16 bytes are also used as the AES-CTR IV for the live session.
-  std::array<uint8_t, 20> session_iv_response_{0x01, 0x00, 0x00, 0x00};
+  // Per-connection encrypted-session state (token slot, IV, anti-replay,
+  // transport crypto). Only ever touched from the main task.
+  LockSession session_{};
 
-  // Per-session anti-replay state. Reset on connect, disconnect, and on
-  // every IV re-negotiation.
-  static constexpr size_t REPLAY_HISTORY_SIZE = 8;
-  static constexpr size_t MAX_REPLAY_PAYLOAD = 32;
-  struct ReplayEntry {
-    std::array<uint8_t, MAX_REPLAY_PAYLOAD> data{};
-    size_t length{0};
-  };
-  std::array<ReplayEntry, REPLAY_HISTORY_SIZE> replay_history_{};
-  size_t replay_head_{0};
-  bool iv_established_{false};
+  // ----- Keypad battery state --------------------------------------------------
+
+  ESPPreferenceObject keypad_info_pref_;
+  KeypadInfo keypad_info_{};
+  bool keypad_paired_{false};
+
+  uint32_t battery_scan_interval_ms_{15 * 60 * 1000};
+  uint32_t next_battery_scan_at_{0};  // millis() deadline for the next scan
+  // Written by loop(), read by the NimBLE scan callback as its "is this our
+  // scan window?" gate — hence atomic.
+  std::atomic<bool> battery_scan_active_{false};
+  BatteryScanCallbacks *battery_scan_callbacks_{nullptr};
+  int last_battery_{-1};  // last published value; -1 = nothing published yet
+
+  // Latest advert parsed by the NimBLE scan callback, handed to loop()
+  // under rx_mutex_ (same pattern as the RX queue).
+  bool battery_advert_pending_{false};
+  int battery_advert_value_{-1};
+  uint8_t battery_advert_mac_[6]{};
+  uint8_t battery_advert_family_{0};
 };
 
 // Home Assistant button that unpairs the keypad: forgets it, rotates the
