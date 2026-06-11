@@ -1,25 +1,35 @@
-# SwitchBot Keypad Bridge
+<div align="center">
 
-> Use a **SwitchBot Keypad without a SwitchBot Lock** — pair it straight to an
-> ESP32 and turn every PIN, fingerprint, NFC, and face unlock into a Home Assistant event.
+# 🔐 SwitchBot Keypad Bridge
 
-<p align="center">
-  <img src="docs/pairing.gif" alt="Pairing a SwitchBot Keypad through the on-device wizard" width="320">
-</p>
+**Use a SwitchBot Keypad without a SwitchBot Lock.**
 
-An [ESPHome](https://esphome.io/) external component that makes an ESP32
-impersonate a **SwitchBot Lock** over Bluetooth LE. A genuine SwitchBot Keypad
-pairs to it and sends its usual encrypted `lock` / `unlock` frames — plus the
-`doorbell` press on Keypad Vision — and the bridge decrypts them on the fly and
-hands them to Home Assistant. The keypad never knows it isn't talking to a real
-lock.
+An ESP32 that impersonates a SwitchBot Lock over Bluetooth LE — a genuine keypad
+pairs to it, and every PIN, fingerprint, NFC tag and face unlock becomes a
+Home Assistant event. The keypad never knows it isn't talking to a real lock.
 
-## Why use it
+[![ESPHome](https://img.shields.io/badge/ESPHome-external__component-1d97d4?logo=esphome&logoColor=white)](https://esphome.io/)
+[![ESP32](https://img.shields.io/badge/ESP32-ESP--IDF%20%2B%20NimBLE-e7352c?logo=espressif&logoColor=white)](https://www.espressif.com/)
+[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-events%20%26%20triggers-03a9f4?logo=homeassistant&logoColor=white)](https://www.home-assistant.io/)
+[![Buy Me A Coffee](https://img.shields.io/badge/support-buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/pierluigizagaria)
+
+<img src="docs/pairing.gif" alt="Pairing a SwitchBot Keypad through the on-device wizard" width="320">
+
+*The on-device pairing wizard — no Python scripts, no BLE sniffing, no laptop.*
+
+</div>
+
+---
+
+## ✨ Highlights
 
 - 🔓 **No SwitchBot Lock required** — repurpose a keypad as a standalone, fully
   local door/access controller.
-- 📲 **On-device pairing wizard** — sign in to your SwitchBot account, pick the
-  keypad, done. No Python script, no laptop, no BLE sniffing.
+- 📟 **Every SwitchBot keypad works** — Keypad, Keypad Touch, Keypad Vision and
+  Vision Pro: that's the whole lineup. Touch and Vision are tested on real
+  hardware; the other two speak the exact same protocols.
+- 📲 **On-device pairing wizard** — the ESP32 serves a small web page: sign in
+  to your SwitchBot account, pick the keypad, done.
 - 👤 **Knows who unlocked** — every unlock carries the method (`pin` /
   `fingerprint` / `nfc` / `face`) and the credential slot, so you can act per user.
 - 🔔 **Doorbell, no lock needed** — on Keypad Vision the doorbell button is
@@ -29,28 +39,41 @@ lock.
   diagnostic sensor.
 - 🔐 **Keys never leave the device** — the AES-128 session key is generated on
   the ESP32 and stored in NVS; it is never in your YAML or git.
-- 🧩 **Pure ESPHome** — exposes a standard `event` entity plus `on_lock` /
-  `on_unlock` / `on_doorbell` automation triggers. No cloud, no extra dependencies.
+- 🏠 **100% local after pairing** — the cloud is contacted exactly once, during
+  pairing. Day-to-day operation is pure BLE + ESPHome, no cloud round-trips.
 
-## Supported keypads
+## 🧠 How it works
 
-The wizard identifies the keypad model **from its BLE advertisement**
-(pySwitchbot-style) and adapts the pairing protocol accordingly. Detection
-never touches the cloud SKU string, so even a keypad with a brand-new SKU
-pairs fine.
+A SwitchBot Keypad is not a dumb button matrix: it encrypts every command with
+AES-CTR and only talks to a device that advertises like a SwitchBot Lock,
+answers the lock GATT protocol, **and** carries a `B0:E9:FE` SwitchBot MAC.
+The bridge plays that part end to end:
 
-| Model | Protocol family | Status |
-|---|---|---|
-| SwitchBot Keypad Touch | Original | ✅ **Tested** |
-| SwitchBot Keypad Vision | Vision | ✅ **Tested** |
-| SwitchBot Keypad | Original | Supported — same protocol as Touch |
-| SwitchBot Keypad Vision Pro | Vision | Supported — same protocol as Vision |
+```mermaid
+sequenceDiagram
+    participant K as 🔢 SwitchBot Keypad
+    participant B as 📡 ESP32 Bridge
+    participant HA as 🏠 Home Assistant
 
-> Because the keypad is recognised from its live advertisement, keep it within
-> ~2 m and powered while you run the wizard — out-of-range devices won't be
-> listed.
+    Note over B: advertises as a SwitchBot Lock<br/>(spoofed B0:E9:FE MAC)
+    K->>B: encrypted unlock frame (AES-CTR)
+    B->>B: decrypt → method + credential slot
+    B-->>K: encrypted lock-style ACK
+    B->>HA: event: Unlock (fingerprint, slot 0)
+    HA->>HA: your automation runs 🎉
+```
 
-## Quick start
+**Pairing** is the only step that touches the cloud, because the keypad ships
+encrypted with a *communication key* that lives on SwitchBot's servers, not in
+the app. The on-device wizard signs in to your account, fetches that key over
+HTTPS, uses it to re-encrypt the pairing handshake, and injects a fresh AES-128
+session key generated on the ESP32. From that moment the keypad and the bridge
+share a secret no one else has — including SwitchBot.
+
+Curious about the details — MAC spoofing, NimBLE, key rotation? See
+[Under the hood](#-under-the-hood).
+
+## 🚀 Quick start
 
 **You need:** an ESP32 and a SwitchBot Keypad already added to your SwitchBot
 account.
@@ -82,6 +105,9 @@ boot log, or use Home Assistant's **Visit Device** link on the device page):
 2. Pick your keypad from the list.
 3. Wait for the wizard to finish — it closes itself when done.
 
+> The wizard recognises the keypad from its live BLE advertisement, so keep it
+> powered and within ~2 m of the ESP32 — out-of-range devices won't be listed.
+
 That's it. The keypad's name appears on the **Keypad** sensor and key presses
 arrive in Home Assistant as `Lock` / `Unlock` / `Doorbell` events.
 
@@ -95,7 +121,7 @@ To stream logs at any time:
 esphome logs switchbot-keypad-bridge.yaml
 ```
 
-## Knowing who unlocked the door
+## 👤 Knowing who unlocked the door
 
 Every `on_unlock` trigger carries two values:
 
@@ -139,7 +165,7 @@ actions:
       message: Welcome home!
 ```
 
-## Doorbell (Keypad Vision)
+## 🔔 Doorbell (Keypad Vision)
 
 The official app hides the doorbell button until a SwitchBot Lock is bound to
 your account, so the bridge enables it automatically at the end of pairing.
@@ -154,10 +180,9 @@ switchbot_keypad_bridge:
 
 > Vision family only — Original / Touch keypads have no doorbell button.
 
-## Keypad battery
+## 🔋 Keypad battery
 
-The keypad broadcasts its battery level in its BLE advertisement — the same
-source [pySwitchbot](https://github.com/sblibs/pySwitchbot) reads. Add the
+The keypad broadcasts its battery level in its BLE advertisement. Add the
 `battery_level` sensor and the bridge picks it up with a short background scan
 (every 15 minutes by default):
 
@@ -168,11 +193,7 @@ switchbot_keypad_bridge:
   battery_scan_interval: 15min
 ```
 
-The scan targets the MAC saved at pairing time and is skipped while the keypad
-is connected or the wizard is busy. Keypads paired before this feature existed
-are adopted automatically from their advertisement — no re-pairing needed.
-
-## Configuration reference
+## ⚙️ Configuration reference
 
 | Option | Type | Required | Description |
 |---|---|---|---|
@@ -185,33 +206,71 @@ are adopted automatically from their advertisement — no re-pairing needed.
 | `on_unlock` | automation | no | Triggered on every `unlock` command — parameters `(std::string method, int index)`. |
 | `on_doorbell` | automation | no | Triggered on every doorbell press (Keypad Vision). No parameters. |
 
-## How it works
+## 🔬 Under the hood
 
-### Security
+- **Model detection over BLE** — the wizard identifies the keypad model from
+  its live advertisement (pySwitchbot-style) and adapts the pairing protocol
+  accordingly, so even a future model pairs fine as long as it speaks one of
+  the two protocol families (*Original* or *Vision*).
+- **MAC spoofing** — at boot the bridge rewrites its BLE address into
+  SwitchBot's OUI (`B0:E9:FE:xx:xx:xx`), preserving the chip-unique last three
+  bytes. The Keypad Vision filters scan results on this prefix and would
+  otherwise ignore the bridge.
+- **NimBLE, not the ESPHome BLE stack** — the component drives NimBLE directly
+  (via the `esp-nimble-cpp` managed component) and uses the mbed-TLS PSA Crypto
+  API that already ships with ESP-IDF. No extra Python or C++ dependencies —
+  but it cannot coexist with ESPHome's own BLE stack (`esp32_ble`,
+  `esp32_ble_tracker`, `esp32_improv`, …).
+- **Key hygiene** — unpairing rotates the session key, so a previously paired
+  keypad can no longer command the bridge.
 
-The AES-128 session key is generated on the device on first boot, kept in NVS,
-and injected into the keypad during pairing. It is never part of the YAML
-configuration and never leaves the device. The **Unpair** button rotates it, so
-a keypad paired before an unpair can no longer command the bridge afterwards.
+## ❓ FAQ
 
-### Implementation notes
+<details>
+<summary><b>Why do I have to sign in with my SwitchBot account?</b></summary>
 
-- The component uses NimBLE (via the `esp-nimble-cpp` managed component) and the
-  mbed-TLS PSA Crypto API that already ships with ESP-IDF. No additional Python
-  or C++ dependencies are required.
-- AES-CTR is symmetric: the same `aes_ctr_xcrypt_` primitive handles both
-  encryption (responses) and decryption (incoming commands).
-- At boot the bridge spoofs the chip's BLE address into SwitchBot's OUI
-  (`B0:E9:FE:xx:xx:xx`), preserving the chip-unique last three bytes so every
-  device still has a distinct identifier. The Keypad Vision filters scan results
-  on this prefix and would otherwise ignore the bridge. Read the advertised
-  address from the boot log (`Ready. Advertising on …`) — it is *not* the Wi-Fi
-  MAC Home Assistant displays on the device card.
-- `FINAL_VALIDATE_SCHEMA` raises a hard error if `esp32_ble`,
-  `esp32_ble_tracker`, `esp32_improv`, etc. are present in the config — NimBLE
-  cannot coexist with ESPHome's BLE stack.
+The keypad encrypts its pairing handshake with a *communication key* that is
+issued and stored by SwitchBot's servers — it is not in the app and cannot be
+read from the keypad itself. The wizard signs in from the ESP32, fetches that
+key over HTTPS, and uses it once to complete the handshake. After pairing the
+keypad talks to the bridge with a locally generated session key and the cloud
+is never contacted again.
+</details>
 
-## Support
+<details>
+<summary><b>Is anything cloud-dependent after pairing?</b></summary>
+
+No. Unlock events, the doorbell, battery readings — everything runs over local
+BLE between the keypad and the ESP32, and over the native API between the
+ESP32 and Home Assistant.
+</details>
+
+<details>
+<summary><b>Home Assistant shows a different MAC than the boot log — which is right?</b></summary>
+
+Both. Home Assistant shows the Wi-Fi MAC; the boot log
+(`Ready. Advertising on …`) shows the BLE address, which the bridge spoofs
+into SwitchBot's `B0:E9:FE` OUI so the keypad will accept it.
+</details>
+
+<details>
+<summary><b>My keypad doesn't show up in the wizard.</b></summary>
+
+The wizard only lists devices it can *see* over BLE. Make sure the keypad is
+powered, within ~2 m of the ESP32, and added to the SwitchBot account you
+signed in with.
+</details>
+
+<details>
+<summary><b>ESPHome refuses to compile with <code>esp32_ble</code> / <code>esp32_ble_tracker</code> in my config.</b></summary>
+
+That's intentional. The bridge drives NimBLE directly and cannot share the
+radio with ESPHome's BLE stack, so config validation fails fast instead of
+producing a firmware that breaks at runtime. Remove the conflicting components
+(including `esp32_improv`).
+</details>
+
+## ☕ Support
 
 If this project saved you the cost of a SwitchBot Lock — or just made your day —
 consider buying me a coffee. It's a great way to say thanks and keep the work
