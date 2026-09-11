@@ -553,6 +553,12 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
       ESP_LOGI(TAG, "Unlock: method=%s (0x%02X) index=%d",
                unlock_method_name(command.method),
                static_cast<uint8_t>(command.method), command.credential_index);
+      // TEMP DEBUG (credential-index investigation): dump the full decrypted
+      // plaintext so we can see every byte of a real Vision face/fingerprint
+      // unlock frame, not just the single byte the current heuristic reads.
+      ESP_LOGI(TAG, "Unlock raw plaintext (%u bytes): %s",
+               static_cast<unsigned>(this->session_.plaintext_size()),
+               format_hex_pretty(this->session_.plaintext(), this->session_.plaintext_size()).c_str());
       this->lock_state_ = LockState::UNLOCKED;
       this->publish_unlock_(command.method, command.credential_index);
       break;
@@ -567,6 +573,13 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
       break;
 
     case CommandType::UNKNOWN:
+      // TEMP DEBUG (credential-index investigation): unknown frames were
+      // previously dropped completely silently — log them in case Vision
+      // sends a separate frame around a biometric unlock that carries the
+      // real per-credential identity.
+      ESP_LOGI(TAG, "Unknown frame (%u bytes): %s",
+               static_cast<unsigned>(this->session_.plaintext_size()),
+               format_hex_pretty(this->session_.plaintext(), this->session_.plaintext_size()).c_str());
     default:
       break;
   }
