@@ -321,3 +321,8 @@ async def to_code(config):
     include_builtin_idf_component("esp_http_client")
     include_builtin_idf_component("esp-tls")
     include_builtin_idf_component("json")
+
+    # pairing_ui.cpp's on-device setup wizard listens with ESP-IDF's
+    # esp_http_server -- also not pulled in by anything else here, despite
+    # NimBLE being enabled.
+    include_builtin_idf_component("esp_http_server")

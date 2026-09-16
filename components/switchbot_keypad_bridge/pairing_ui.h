@@ -13,8 +13,9 @@
 //   POST /api/lock/link          → {mac} → {job_id, labels: [step names]}
 //   GET  /api/lock/link/status   → {step, total, message, done, error}
 //
-// The server uses ESP-IDF's `esp_http_server` (already pulled in by NimBLE
-// and the ESP-IDF framework — no extra managed components needed).
+// The server uses ESP-IDF's `esp_http_server` -- pulled in explicitly via
+// include_builtin_idf_component("esp_http_server") in __init__.py, it is
+// not otherwise on by default even with NimBLE enabled.
 // It binds to port 80 by default; if ESPHome's `web_server:` is also
 // enabled the user must move one of the two onto a different port.
 
