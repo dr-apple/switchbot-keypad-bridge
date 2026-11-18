@@ -11,6 +11,7 @@
 #include "esphome/core/log.h"
 #include "aes_ctr.h"
 #include "ble_utils.h"
+#include "hex_util.h"
 #include "mac_utils.h"
 
 namespace esphome {
@@ -563,7 +564,7 @@ bool PhysicalLockClient::send_encrypted_(const Config &config, const Session &se
   }
 
   ESP_LOGV(TAG, "TX lock %s",
-           format_hex_pretty(frame.data(), frame.size()).c_str());
+           hex_pretty(frame.data(), frame.size()).c_str());
   if (!rx->writeValue(frame.data(), frame.size(), /*response=*/true)) {
     error_out = "Could not write encrypted command to the lock.";
     return false;
@@ -580,7 +581,7 @@ bool PhysicalLockClient::decrypt_notify_(const Config &config, const Session &se
     return false;
   }
   const uint8_t *data = reinterpret_cast<const uint8_t *>(wire.data());
-  ESP_LOGV(TAG, "RX lock %s", format_hex_pretty(data, wire.size()).c_str());
+  ESP_LOGV(TAG, "RX lock %s", hex_pretty(data, wire.size()).c_str());
   const size_t payload_len = wire.size() - WIRE_HEADER_LEN;
   out.resize(payload_len);
   if (payload_len == 0) {
@@ -603,7 +604,7 @@ bool PhysicalLockClient::decrypt_notify_(const Config &config, const Session &se
     }
   }
   ESP_LOGV(TAG, "RX lock plaintext %s",
-           format_hex_pretty(out.data(), out.size()).c_str());
+           hex_pretty(out.data(), out.size()).c_str());
   return true;
 }
 

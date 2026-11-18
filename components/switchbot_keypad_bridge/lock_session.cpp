@@ -7,6 +7,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "aes_ctr.h"
+#include "hex_util.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {
@@ -55,7 +56,7 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   this->clear_transient_();
 
   ESP_LOGV(TAG, "RX WIRE %zu bytes: %s", frame.size(),
-           format_hex_pretty(reinterpret_cast<const uint8_t *>(frame.data()), frame.size()).c_str());
+           hex_pretty(reinterpret_cast<const uint8_t *>(frame.data()), frame.size()).c_str());
 
   if (this->is_iv_request_(frame)) {
     // The IV request advertises which key_id the keypad will use for the
@@ -150,7 +151,7 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
     return Action::NONE;  // error already logged
   }
 
-  ESP_LOGD(TAG, "RX %s", format_hex_pretty(plaintext, ct_len).c_str());
+  ESP_LOGD(TAG, "RX %s", hex_pretty(plaintext, ct_len).c_str());
 
   this->command_ = decode_lock_command(plaintext, ct_len);
 
@@ -199,7 +200,7 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   }
 
   if (this->command_.type == CommandType::UNKNOWN) {
-    ESP_LOGI(TAG, "Unhandled command: %s", format_hex_pretty(plaintext, ct_len).c_str());
+    ESP_LOGI(TAG, "Unhandled command: %s", hex_pretty(plaintext, ct_len).c_str());
   }
 
   // DOORBELL is deliberately left out of the replay filter: under a fixed
@@ -297,7 +298,7 @@ void LockSession::ensure_pending_iv_() {
     std::memcpy(this->iv_response_.data() + IV_RESPONSE_HEADER,
                 this->pending_.iv.data(), AES_IV_SIZE);
     ESP_LOGV(TAG, "Reusing pending IV: %s",
-             format_hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
+             hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
     return;
   }
 
@@ -339,7 +340,7 @@ void LockSession::ensure_pending_iv_() {
   std::memcpy(this->iv_response_.data() + IV_RESPONSE_HEADER,
               this->pending_.iv.data(), AES_IV_SIZE);
   ESP_LOGV(TAG, "Pending IV: %s",
-           format_hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
+           hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
 }
 
 bool LockSession::is_replayed_ciphertext_(const CryptoContext &context,
